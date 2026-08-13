@@ -1,0 +1,13 @@
+# Storage for Postgres's own data directory. ReadWriteOnce is correct here (unlike the earlier
+# SQLite design this replaced) - only ONE Postgres pod ever mounts this; the API pods talk to
+# Postgres over the network as a normal database client, they don't touch this volume directly.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: finmonitor-postgres-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

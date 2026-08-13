@@ -1,5 +1,7 @@
 # Image is built from frontend/Dockerfile; its nginx.conf proxies /api and /hubs to the
 # "finmonitor-api" Service by DNS name, so no ingress/CORS config is needed for this to work.
+# imagePullPolicy: Always - see the note in deployment.yaml on why, for a local kind-based
+# cluster with no registry in front of it.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -19,7 +21,7 @@ spec:
       containers:
         - name: frontend
           image: finmonitor-frontend:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - containerPort: 80
           resources:

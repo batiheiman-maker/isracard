@@ -29,13 +29,17 @@ builder.Services.AddCors(options =>
         .AllowCredentials());
 });
 
-// Storage: in-memory per pod by default (single-instance/local dev); a shared SQLite file
-// (mounted volume/PVC) in distributed mode so GET /api/transactions is consistent across pods.
+// Storage: in-memory per pod by default (single-instance/local dev); a shared PostgreSQL
+// database in distributed mode so GET /api/transactions is consistent across pods. Postgres
+// (not SQLite over a shared volume) because it's built for concurrent multi-writer access -
+// see the ADR in README.md for why that distinction actually matters here.
 var storageProvider = builder.Configuration["Storage:Provider"] ?? "InMemory";
-if (storageProvider.Equals("Sqlite", StringComparison.OrdinalIgnoreCase))
+if (storageProvider.Equals("Postgres", StringComparison.OrdinalIgnoreCase))
 {
-    var connectionString = builder.Configuration["Storage:ConnectionString"] ?? "Data Source=finmonitor.db";
-    builder.Services.AddSingleton<ITransactionRepository>(_ => new SqliteTransactionRepository(connectionString));
+    var connectionString = builder.Configuration["Storage:ConnectionString"]
+        ?? throw new InvalidOperationException("Storage:ConnectionString is required when Storage:Provider is Postgres.");
+    var repository = PostgresTransactionRepository.CreateAsync(connectionString).GetAwaiter().GetResult();
+    builder.Services.AddSingleton<ITransactionRepository>(repository);
 }
 else
 {

@@ -3,20 +3,36 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
 
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: finmonitor
+      POSTGRES_USER: finmonitor
+      POSTGRES_PASSWORD: finmonitor
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finmonitor -d finmonitor"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
   api1:
     build:
       context: ./backend/src
       dockerfile: FinMonitor.Api/Dockerfile
     environment: &api-env
       INSTANCE_NAME: api1
-      Storage__Provider: Sqlite
-      Storage__ConnectionString: "Data Source=/data/finmonitor.db"
+      Storage__Provider: Postgres
+      Storage__ConnectionString: "Host=postgres;Port=5432;Database=finmonitor;Username=finmonitor;Password=finmonitor"
       Redis__Enabled: "true"
       Redis__ConnectionString: "redis:6379,abortConnect=false"
-    volumes:
-      - sqlite-data:/data
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
 
   api2:
     build:
@@ -25,10 +41,11 @@ services:
     environment:
       <<: *api-env
       INSTANCE_NAME: api2
-    volumes:
-      - sqlite-data:/data
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
 
   api3:
     build:
@@ -37,10 +54,11 @@ services:
     environment:
       <<: *api-env
       INSTANCE_NAME: api3
-    volumes:
-      - sqlite-data:/data
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
 
   frontend-lb:
     build:
@@ -54,4 +72,4 @@ services:
       - api3
 
 volumes:
-  sqlite-data:
+  postgres-data:

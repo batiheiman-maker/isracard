@@ -3,6 +3,15 @@
 # `replicas: 5` mirrors the assignment's own framing ("if we deploy this backend to 5 pods...")
 # and is just the starting point - once hpa.yaml is applied, the HorizontalPodAutoscaler takes
 # over this field and adjusts it (3-10) based on memory load.
+# imagePullPolicy: Always (not IfNotPresent) - on a local kind-based cluster (e.g. Docker
+# Desktop's built-in Kubernetes), rebuilding an image under the SAME tag while iterating can
+# leave a stale cached copy on the node even after `kubectl rollout restart`, since the node
+# never re-checks a tag it already has under IfNotPresent. Hit this for real: after replacing
+# SQLite with Postgres, pods kept silently running old in-memory-fallback code with zero
+# Postgres connections, while POSTs still "succeeded" against each pod's own local memory -
+# only visible as GET counts that varied per pod instead of matching the shared database. A
+# real registry with immutable per-build tags wouldn't have this problem; Always is the
+# pragmatic fix for local iteration against a cluster with no registry in front of it.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -22,7 +31,7 @@ spec:
       containers:
         - name: api
           image: finmonitor-api:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
           env:
@@ -31,16 +40,13 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             - name: Storage__Provider
-              value: "Sqlite"
+              value: "Postgres"
             - name: Storage__ConnectionString
-              value: "Data Source=/data/finmonitor.db"
+              value: "Host=finmonitor-postgres;Port=5432;Database=finmonitor;Username=finmonitor;Password=finmonitor"
             - name: Redis__Enabled
               value: "true"
             - name: Redis__ConnectionString
               value: "finmonitor-redis:6379,abortConnect=false"
-          volumeMounts:
-            - name: sqlite-data
-              mountPath: /data
           resources:
             requests:
               cpu: 100m
@@ -60,7 +66,3 @@ spec:
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
-      volumes:
-        - name: sqlite-data
-          persistentVolumeClaim:
-            claimName: finmonitor-sqlite-data

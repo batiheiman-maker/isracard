@@ -1,0 +1,56 @@
+# Single-replica Postgres, the shared database backing distributed mode (replaces an earlier
+# SQLite-over-shared-volume design - see the ADR in README.md for why). Demo-only: a production
+# deployment would use a managed Postgres (RDS, Cloud SQL, Azure Database for PostgreSQL) or a
+# proper HA setup (e.g. a StatefulSet + replication), not documented/implemented here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: finmonitor-postgres
+  labels:
+    app: finmonitor-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: finmonitor-postgres
+  template:
+    metadata:
+      labels:
+        app: finmonitor-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: finmonitor
+            - name: POSTGRES_USER
+              value: finmonitor
+            - name: POSTGRES_PASSWORD
+              value: finmonitor
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "finmonitor", "-d", "finmonitor"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "finmonitor", "-d", "finmonitor"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: finmonitor-postgres-data

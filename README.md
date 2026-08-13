@@ -24,7 +24,7 @@ flowchart LR
         API2[API pod 2]
         API3[API pod 3]
         Redis[(Redis<br/>SignalR backplane)]
-        SQLite[(Shared SQLite file<br/>volume/PVC)]
+        Postgres[(Shared PostgreSQL)]
     end
 
     Add -- POST /api/transactions --> LB
@@ -32,7 +32,7 @@ flowchart LR
     Monitor -- WebSocket /hubs/transactions --> LB
     API1 & API2 & API3 -- pub/sub notify --> Redis
     Redis -- fan-out to all pods' clients --> API1 & API2 & API3
-    API1 & API2 & API3 -- read/write --> SQLite
+    API1 & API2 & API3 -- read/write --> Postgres
 ```
 
 - **Ingestion**: `POST /api/transactions` validates and stores the transaction, then broadcasts
@@ -40,23 +40,26 @@ flowchart LR
 - **Real-time layer**: SignalR hub (`/hubs/transactions`), push-only.
 - **Storage**: two modes behind the same `ITransactionRepository` interface -
   - *Single instance / local dev*: `InMemoryTransactionRepository` (`ConcurrentDictionary`).
-  - *Distributed (compose/k8s)*: `SqliteTransactionRepository` pointed at one shared file on a
-    mounted volume/PVC, so `GET /api/transactions` is consistent no matter which pod answers it.
+  - *Distributed (compose/k8s)*: `PostgresTransactionRepository`, a shared PostgreSQL database
+    every pod connects to as a normal network client, so `GET /api/transactions` is consistent
+    no matter which pod answers it. (An earlier design shared a SQLite file over a mounted
+    volume/PVC instead - replaced for correctness reasons covered in the
+    [ADR](#10-adr-distributed-real-time-synchronization-across-pod-replicas) below.)
 - **Cross-pod real-time sync**: SignalR's Redis backplane (`AddStackExchangeRedis`) so a
   broadcast from any pod reaches every connected client, regardless of which pod it's attached
-  to. See the [ADR](#10-adr-distributed-real-time-synchronization-across-pod-replicas) below.
+  to. See the ADR below.
 
 ## 3. Tech stack
 
 | Layer | Choice |
 |---|---|
 | Backend | .NET 8, minimal APIs, SignalR |
-| Domain/tests | xUnit, FluentAssertions, Moq |
-| Storage | `ConcurrentDictionary` (single instance) / SQLite (distributed) |
+| Domain/tests | xUnit, FluentAssertions, Moq, Testcontainers |
+| Storage | `ConcurrentDictionary` (single instance) / PostgreSQL via Npgsql (distributed) |
 | Real-time backplane | Redis (`Microsoft.AspNetCore.SignalR.StackExchangeRedis`) |
 | Frontend | React 19, TypeScript, Vite, React Router, `@microsoft/signalr`, framer-motion |
 | Containers | Docker (multi-stage, alpine), docker-compose, nginx |
-| Orchestration | Kubernetes manifests (Deployment/Service for API, Redis, frontend) + HorizontalPodAutoscaler |
+| Orchestration | Kubernetes manifests (Deployment/Service for API, Redis, Postgres, frontend) + HorizontalPodAutoscaler |
 
 ## 4. Project structure
 
@@ -69,11 +72,11 @@ mid-fullstack-assessment/
 │   │   ├── Repositories/         # project - FinMonitor.Domain.* namespaces are kept for
 │   │   ├── Services/             # clarity even though everything now lives in one project
 │   │   └── Realtime/, Endpoints/, Hubs/, Middleware/
-│   └── tests/FinMonitor.Tests/   # xUnit
+│   └── tests/FinMonitor.Tests/   # xUnit + Testcontainers (real Postgres in CI-less integration tests)
 ├── frontend/                     # Vite + React + TypeScript
-├── docker-compose.yml            # redis + 3 API replicas + nginx LB (distributed proof)
+├── docker-compose.yml            # redis + postgres + 3 API replicas + nginx LB (distributed proof)
 ├── docker/nginx-lb.conf          # WS-aware load balancer config, round-robin
-├── k8s/                          # Deployment/Service manifests for api, redis, frontend + hpa.yaml
+├── k8s/                          # Deployment/Service manifests for api, redis, postgres, frontend + hpa.yaml
 └── scripts/hammer.ps1            # 100-rapid-POST load test (standalone, without the UI button)
 ```
 
@@ -101,40 +104,49 @@ another tab to watch them arrive live. Vite's dev server proxies `/api` and `/hu
 > **Verified live.** `docker compose up --build` was run end-to-end: 6 sequential POSTs to
 > `http://localhost:8080/api/transactions` came back with `X-Served-By: api1/api2/api3` cycling
 > in strict round-robin, `GET /api/transactions` showed all of them regardless of which pod
-> served each POST (shared SQLite), and a browser connected to `/monitor` received every one of
-> them in real time over the SignalR/Redis backplane as they arrived - confirmed via the browser
-> console and DOM, not just by inspection.
+> served each POST (shared Postgres, confirmed both via the API and by querying Postgres
+> directly), and a browser connected to `/monitor` received every one of them in real time over
+> the SignalR/Redis backplane as they arrived - confirmed via the browser console and DOM, not
+> just by inspection.
 >
-> Three real bugs surfaced and were fixed while getting this to work, in case you hit the same
-> ones on a different machine:
+> Real bugs surfaced and were fixed while getting this to work, in case you hit the same ones on
+> a different machine:
 > 1. `.dockerignore` was at `backend/.dockerignore`, but the build context (per
 >    `docker-compose.yml`) is `backend/src` - Docker only honors a `.dockerignore` at the context
 >    root, so it was silently ignored and stale `obj/` folders from local Windows `dotnet build`
 >    runs leaked into the image, overwriting the fresh Linux restore output with one containing a
 >    Windows-only NuGet fallback path and breaking `dotnet publish`. Fixed by moving it to
 >    `backend/src/.dockerignore`.
-> 2. The shared SQLite volume (`/data`) is root-owned by default when Docker creates it, but the
->    container runs as non-root `appuser` -> `SQLite Error 14: unable to open database file`.
->    Fixed with `docker-entrypoint.sh`, which `chown`s `/data` while still root, then drops to
->    `appuser` via `su-exec` before running the app.
-> 3. **The interesting one**: the dashboard couldn't connect to the hub at all through the LB
->    (`WebSocket failed to connect... check that sticky sessions are enabled`). This is a
->    real, separate SignalR requirement, not a bug in the Redis backplane itself - SignalR's
->    `negotiate` call and the follow-up WebSocket/SSE/LongPolling upgrade must land on the *same*
->    server, because the connection id only exists in that one process's memory; the Redis
->    backplane broadcasts *messages* between already-connected clients across pods, it doesn't
->    (and can't) share a live in-process transport handle. Fixed with **two separate upstream
->    pools** in `docker/nginx-lb.conf`: `/hubs/` uses `ip_hash` (sticky, required for the
->    handshake), `/api/` stays plain round-robin (not sticky - this is the exact path the bonus
->    is about, and it has to stay non-sticky for the proof to mean anything).
+> 2. **The dashboard couldn't connect to the hub at all through the LB**
+>    (`WebSocket failed to connect... check that sticky sessions are enabled`). A real, separate
+>    SignalR requirement, not a bug in the Redis backplane itself - SignalR's `negotiate` call
+>    and the follow-up WebSocket/SSE/LongPolling upgrade must land on the *same* server, because
+>    the connection id only exists in that one process's memory; the Redis backplane broadcasts
+>    *messages* between already-connected clients across pods, it doesn't (and can't) share a
+>    live in-process transport handle. Fixed with **two separate upstream pools** in
+>    `docker/nginx-lb.conf`: `/hubs/` uses `ip_hash` (sticky, required for the handshake), `/api/`
+>    stays plain round-robin (not sticky - this is the exact path the bonus is about, and it has
+>    to stay non-sticky for the proof to mean anything).
+> 3. **API containers starting faster than Postgres was ready to accept connections** crashed the
+>    whole app on startup (`Npgsql.NpgsqlException: Connection refused`) - `depends_on` in
+>    compose only waits for the *container* to start, not the database *inside* it to be ready.
+>    Fixed two ways: a `pg_isready` healthcheck + `depends_on: condition: service_healthy` in
+>    `docker-compose.yml`, and (since Kubernetes gives no ordering guarantee between pods at all,
+>    so compose-level sequencing wouldn't help there anyway) a retry-with-backoff loop around the
+>    initial connection in `PostgresTransactionRepository.CreateAsync`.
+> 4. **`CREATE TABLE IF NOT EXISTS` raced when many pods started at once against a fresh
+>    database** (`duplicate key value violates unique constraint "pg_type_typname_nsp_index"`) -
+>    a documented Postgres quirk: concurrent sessions can each see "doesn't exist yet" and
+>    collide creating it. Fixed with a Postgres advisory lock (`pg_advisory_lock`) around schema
+>    creation, serializing it across connections without external coordination.
 
 ```bash
 docker compose up --build
 ```
 
-This starts Redis, three API replicas (`api1`/`api2`/`api3`, each with `Redis:Enabled=true` and
-pointed at a shared SQLite file on a named volume), and one nginx container that serves the
-built frontend and round-robins `/api` and `/hubs` across the three replicas.
+This starts Redis, Postgres, three API replicas (`api1`/`api2`/`api3`, each with
+`Redis:Enabled=true` and pointed at the shared Postgres database), and one nginx container that
+serves the built frontend and round-robins `/api` and `/hubs` across the three replicas.
 
 Open `http://localhost:8080/monitor`, then from a shell:
 
@@ -160,13 +172,13 @@ the committed file).
 ## 7. Run on Kubernetes
 
 > **Verified live** against Docker Desktop's built-in single-node cluster (`kind` under the
-> hood): all 8 manifests applied cleanly, 5 `finmonitor-api` pods came up from one `Deployment`
+> hood): all 11 manifests applied cleanly, 5 `finmonitor-api` pods came up from one `Deployment`
 > (no manual per-pod duplication - contrast with docker-compose's `api1`/`api2`/`api3`, which
 > exist as separate blocks specifically to give each one a distinct `X-Served-By` name; in k8s
-> each pod gets its instance name for free from the Downward API, `fieldRef: metadata.name`),
-> a `POST`/`GET` round-trip through 10 requests hit 4+ distinct pods, `GET /api/transactions`
-> showed all of them (shared PVC), and the dashboard received every one of them live regardless
-> of which pod served the POST.
+> each pod gets its instance name for free from the Downward API, `fieldRef: metadata.name`), a
+> `POST`/`GET` round-trip through requests hit multiple distinct pods, `GET /api/transactions`
+> and a direct `psql` query against the Postgres pod agreed on the exact same count, and the
+> dashboard received every transaction live regardless of which pod served the POST.
 
 ```bash
 docker build -t finmonitor-api:latest -f backend/src/FinMonitor.Api/Dockerfile backend/src
@@ -190,12 +202,25 @@ upstream pools do, so instead there's a **second Service over the same pods**,
 principle as `docker/nginx-lb.conf`, just expressed as two Services instead of two upstream
 blocks.
 
-**Storage note:** `k8s/sqlite-pvc.yaml` requests `ReadWriteOnce`, not `ReadWriteMany` as
-originally planned - this single-node local cluster's only storage class
-(`rancher.io/local-path`) doesn't support RWX, and since RWO is scoped per *node* (not per pod),
-multiple pods sharing it works fine here because there's only one node. A real multi-node
-production cluster would need an RWX-capable storage class (NFS, Azure Files, EFS) instead -
-documented directly in that file.
+**A k8s-specific bug worth flagging**: after replacing SQLite with Postgres, pods kept starting
+successfully and POSTs kept returning `201 Created` - but a direct `psql` query against the
+Postgres pod showed zero rows, and `GET /api/transactions` returned a different, small count
+each time depending on which pod answered. The rebuilt image was tagged `finmonitor-api:latest`
+- the same tag already cached on the cluster node from the previous (pre-Postgres) build - and
+`imagePullPolicy: IfNotPresent` meant the node never checked whether the underlying image content
+had changed, so pods kept running the *old* code, silently falling back to a per-pod in-memory
+store (each pod's own private data explains the fluctuating counts) with zero Postgres
+connections. Confirmed by rebuilding under a throwaway unique tag, which immediately fixed it.
+Fixed properly by switching both `k8s/deployment.yaml` and `k8s/frontend-deployment.yaml` to
+`imagePullPolicy: Always` - the right call for a local cluster with no registry in front of it
+that gets rebuilt under the same tag while iterating; a real deployment pipeline would instead
+tag images immutably per build/commit and could keep `IfNotPresent`.
+
+**Storage note:** Postgres itself needs storage for its own data directory
+(`k8s/postgres-pvc.yaml`), and that's `ReadWriteOnce` - correctly so, since only the single
+Postgres pod ever mounts it. The API pods don't touch a volume at all anymore; they talk to
+Postgres over the network like any other database client, which is exactly the point of the fix
+in the ADR below.
 
 **HPA note:** `kubectl get hpa` shows `memory: <unknown>/70%` - Docker Desktop's built-in cluster
 doesn't ship a metrics-server, so there's nothing reporting pod memory usage for the
@@ -210,8 +235,10 @@ cd backend
 dotnet test tests/FinMonitor.Tests/FinMonitor.Tests.csproj
 ```
 
-31 tests covering validation, repository concurrency (both in-memory and SQLite-across-instances),
-the service layer, and the HTTP endpoints end-to-end via `WebApplicationFactory`.
+32 tests covering validation, repository concurrency (in-memory, and Postgres via Testcontainers
+- a real, disposable Postgres container per test, not a mock), the service layer, and the HTTP
+endpoints end-to-end via `WebApplicationFactory`. Requires Docker to be running (Testcontainers
+needs it to spin up Postgres); everything else runs without it.
 
 **On the TDD process**: tests were written before their corresponding implementation, one
 component at a time (Validator → Repository/concurrency → Service → Endpoints), confirmed to
@@ -264,53 +291,76 @@ reflect whatever that one pod happened to receive.
   connected clients. Feature-flagged via `Redis:Enabled` (default `false`) so local single-instance
   dev needs no Redis at all. The connection string uses `abortConnect=false` so a Redis outage
   degrades to pod-local broadcast instead of crashing the app.
-- **Consistent storage**: in distributed mode, `Storage:Provider=Sqlite` switches the repository
-  to a single SQLite file on a volume/PVC shared by every replica, so `GET /api/transactions`
-  returns the same answer regardless of which pod serves the request. Single-instance/local dev
-  keeps the simpler in-memory `ConcurrentDictionary` (no shared-storage problem exists with one
-  process).
+- **Consistent storage**: in distributed mode, `Storage:Provider=Postgres` switches the
+  repository to a shared PostgreSQL database every pod connects to as a normal client, so
+  `GET /api/transactions` returns the same answer regardless of which pod serves the request.
+  Single-instance/local dev keeps the simpler in-memory `ConcurrentDictionary` (no
+  shared-storage problem exists with one process).
+
+**Why Postgres and not a shared SQLite file (what was actually tried first).** The first version
+of this fix pointed every pod at one SQLite file on a shared volume/PVC. That was wrong, and not
+just as a matter of opinion - [SQLite's own documentation](https://www.sqlite.org/lockingv3.html)
+states it plainly:
+
+> Network filesystems...do not support locking correctly, or do not support it at all... it is
+> not safe to use SQLite for reading and writing on a network filesystem.
+
+A `ReadWriteMany` volume in a real multi-node cluster is almost always backed by exactly that
+kind of network filesystem (NFS, EFS, Azure Files) - the one case SQLite explicitly says is
+unsafe, with real risk of file corruption, not just a logical race condition. And even with
+perfectly reliable locking, SQLite is single-writer by design (WAL mode doesn't change that) -
+every pod would still serialize behind one writer, which defeats the actual point of having
+multiple replicas and directly fights the "instantly update" requirement with exactly the
+bottleneck multiple replicas exist to avoid. Postgres is built for concurrent multi-writer
+access, which is what this scenario actually needs; SQLite's locking model was never meant to
+solve it, and no amount of extra locking code in this repo would have changed that.
 
 **Consequences.**
 - (+) Near-real-time cross-pod fan-out using an officially supported SignalR extension; minimal
   code change (one conditional `AddStackExchangeRedis` call).
 - (+) Consistent read-your-writes across pods for the GET snapshot, closing the gap a purely
-  in-memory distributed store would leave.
+  in-memory distributed store would leave - and, unlike the SQLite version, genuinely safe under
+  real concurrent writers (proven in `PostgresTransactionRepositoryTests` against a real Postgres
+  container via Testcontainers, not a mock).
 - (−) Redis becomes an infra dependency and adds a latency hop; it's a SPOF for cross-pod
   real-time sync unless run HA (not done here - documented, not implemented).
-- (−) The shared SQLite file requires ReadWriteMany storage in Kubernetes (NFS/EFS/Azure Files);
-  most default cloud block-storage classes are ReadWriteOnly and won't satisfy this. Documented
-  in `k8s/sqlite-pvc.yaml`; not provisioned as part of this assessment.
-- (−) SQLite serializes writers at the file level; fine at this MVP's throughput, would not scale
-  to a high-write-volume production workload - a managed relational/NoSQL store would replace it
-  at that point without changing `ITransactionRepository`'s shape.
+- (−) Postgres is a second infra dependency and, as deployed here (`k8s/postgres-deployment.yaml`,
+  a single replica), is itself a SPOF - a real production deployment would use a managed Postgres
+  (RDS, Cloud SQL, Azure Database for PostgreSQL) or a proper HA setup, not a single pod.
+- (−) Every pod now needs network access to one more service and a connection pool to manage;
+  marginally more moving parts than a local file, traded deliberately for actual write safety.
 
 **Alternatives considered.**
+- *SQLite over a shared volume*: tried first, reverted - see above. Kept as the canonical example
+  in this ADR of a plausible-looking fix that doesn't actually hold up, rather than deleting the
+  evidence that it was considered.
 - *Sticky sessions for the ingestion API* (`POST /api/transactions`, route a client to the same
   pod every time): rejected - it would hide the exact bug this ADR solves rather than fixing it.
   Note this is a *different* question from whether the SignalR *hub connection itself* needs
-  stickiness - it does, for an unrelated reason (see the implementation note in §6): the
+  stickiness - it does, for an unrelated reason (see the implementation notes in §6/§7): the
   `negotiate` handshake and the transport upgrade must land on the same process. That's handled
-  at the load-balancer level (`ip_hash` on the `/hubs/` upstream only) and doesn't touch the
-  ingestion path, so the round-robin proof over `/api/` stays meaningful.
+  at the load-balancer/Service level and doesn't touch the ingestion path, so the round-robin
+  proof over `/api/` stays meaningful.
 - *Client-side polling instead of push*: rejected - contradicts the "instant" real-time
   requirement outright.
-- *Shared external store from the start* (skip in-memory entirely): rejected for local dev - it
-  would mean every developer needs SQLite/Docker running just to run the app once, for no benefit
-  in the single-instance case where the distributed-storage problem doesn't exist yet.
+- *Shared external store from the start* (skip in-memory entirely, even for single-instance
+  mode): rejected for local dev - it would mean every developer needs Postgres/Docker running
+  just to run the app once, for no benefit in the single-instance case where the
+  distributed-storage problem doesn't exist yet.
 
 ## 11. Bonus checklist
 
 | Item | Status |
 |---|---|
 | Distributed architecture - described | ✅ (ADR above) |
-| Distributed architecture - implemented | ✅ Redis backplane + shared SQLite - **verified live** end-to-end via `docker compose up --build` (round-robin `X-Served-By`, shared GET snapshot, real-time browser delivery across pods - see §6) |
+| Distributed architecture - implemented | ✅ Redis backplane + shared Postgres - **verified live** end-to-end via both `docker compose up --build` and a real Kubernetes deployment (round-robin `X-Served-By`, shared storage confirmed via direct DB query, real-time browser delivery across pods - see §6/§7) |
 | Dockerfile, production-optimized | ✅ multi-stage, alpine, non-root, `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true` - built and run live |
-| Kubernetes manifests | ✅ **verified live** on Docker Desktop's built-in cluster - all 8 manifests applied, 5 `finmonitor-api` pods + 2 frontend pods + Redis all `1/1 Running`, PVC bound, round-robin + shared storage + real-time delivery all confirmed (see §7) |
-| Horizontal autoscaling | ✅ `k8s/hpa.yaml` - 3-10 replicas, scales on 70% memory utilization. A separate concern from the sync fix: correctness across pods (Redis/SQLite) has to hold first, or autoscaling would just add more out-of-sync pods. Applied live but shows `<unknown>` - Docker Desktop's cluster has no metrics-server installed (see §7) |
+| Kubernetes manifests | ✅ **verified live** on Docker Desktop's built-in cluster - all 11 manifests applied, 5 `finmonitor-api` pods + 2 frontend pods + Postgres + Redis all `1/1 Running`, PVC bound, round-robin + shared storage + real-time delivery all confirmed (see §7) |
+| Horizontal autoscaling | ✅ `k8s/hpa.yaml` - 3-10 replicas, scales on 70% memory utilization. A separate concern from the sync fix: correctness across pods (Redis/Postgres) has to hold first, or autoscaling would just add more pods hammering the same database harder. Applied live but shows `<unknown>` - Docker Desktop's cluster has no metrics-server installed (see §7) |
 | UI animation on new transactions | ✅ row entrance fade/slide (framer-motion) |
 | UI animation on status change | ✅ CSS transition on the status badge |
 | List virtualization | ❌ deliberately skipped - batching + memoization is sufficient at this scale (see §12), and it fights row-level exit animations |
-| Redis/PVC high availability | ❌ future work, documented in the ADR |
+| Redis/Postgres high availability | ❌ future work, documented in the ADR |
 
 ## 12. Known limitations / future work
 
@@ -320,5 +370,7 @@ reflect whatever that one pod happened to receive.
   (`MAX_TRANSACTIONS` in `useTransactionStream.ts`) to bound DOM size under sustained load.
 - No authentication/authorization on the ingestion API - out of scope for this assessment but
   would be required before any real deployment.
-- Redis and the SQLite PVC are both single points of failure in the k8s manifests as written;
-  production would need Redis Sentinel/Cluster and a properly provisioned RWX storage backend.
+- Redis and Postgres are both single points of failure in the k8s manifests as written;
+  production would need Redis Sentinel/Cluster and a managed/HA Postgres instead of a single pod.
+- No connection pooling tuning or read replicas for Postgres - fine at this MVP's scale, would
+  need attention under real production write/read volume.
