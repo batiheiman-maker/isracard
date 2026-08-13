@@ -1,0 +1,14 @@
+# sessionAffinity intentionally left at the default "None" - same reasoning as the nginx LB in
+# docker-compose: sticky sessions would mask the cross-pod sync problem instead of proving the
+# Redis backplane fix actually works under normal round-robin routing.
+apiVersion: v1
+kind: Service
+metadata:
+  name: finmonitor-api
+spec:
+  selector:
+    app: finmonitor-api
+  sessionAffinity: None
+  ports:
+    - port: 8080
+      targetPort: 8080

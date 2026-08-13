@@ -1,0 +1,15 @@
+# Shared storage for the SQLite file across all API pod replicas (single source of truth for
+# GET /api/transactions - see the ADR in README.md). Requires a storage class that supports
+# ReadWriteMany (e.g. NFS, Azure Files, EFS via the efs-csi-driver) - most default cloud block
+# storage classes (EBS gp2/gp3, GCE PD) are ReadWriteOnce only and will NOT satisfy this claim.
+# Documented as an environment assumption; not provisioned as part of this assessment.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: finmonitor-sqlite-data
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1Gi

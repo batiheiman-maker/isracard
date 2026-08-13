@@ -1,0 +1,31 @@
+# Single-replica Redis for the SignalR backplane pub/sub channel. Demo-only: a production
+# deployment would use a managed Redis or a Sentinel/Cluster setup for HA - documented as a
+# known limitation in the README, not implemented here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: finmonitor-redis
+  labels:
+    app: finmonitor-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: finmonitor-redis
+  template:
+    metadata:
+      labels:
+        app: finmonitor-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi

@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: finmonitor-redis
+spec:
+  selector:
+    app: finmonitor-redis
+  ports:
+    - port: 6379
+      targetPort: 6379

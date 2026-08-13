@@ -1,0 +1,57 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  api1:
+    build:
+      context: ./backend/src
+      dockerfile: FinMonitor.Api/Dockerfile
+    environment: &api-env
+      INSTANCE_NAME: api1
+      Storage__Provider: Sqlite
+      Storage__ConnectionString: "Data Source=/data/finmonitor.db"
+      Redis__Enabled: "true"
+      Redis__ConnectionString: "redis:6379,abortConnect=false"
+    volumes:
+      - sqlite-data:/data
+    depends_on:
+      - redis
+
+  api2:
+    build:
+      context: ./backend/src
+      dockerfile: FinMonitor.Api/Dockerfile
+    environment:
+      <<: *api-env
+      INSTANCE_NAME: api2
+    volumes:
+      - sqlite-data:/data
+    depends_on:
+      - redis
+
+  api3:
+    build:
+      context: ./backend/src
+      dockerfile: FinMonitor.Api/Dockerfile
+    environment:
+      <<: *api-env
+      INSTANCE_NAME: api3
+    volumes:
+      - sqlite-data:/data
+    depends_on:
+      - redis
+
+  frontend-lb:
+    build:
+      context: .
+      dockerfile: docker/nginx-lb.Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      - api1
+      - api2
+      - api3
+
+volumes:
+  sqlite-data:

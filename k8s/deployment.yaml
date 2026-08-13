@@ -1,0 +1,64 @@
+# Image is built from backend/src/FinMonitor.Api/Dockerfile (context: backend/src) and pushed
+# to whatever registry the target cluster pulls from; update `image:` accordingly.
+# `replicas: 5` mirrors the assignment's own framing ("if we deploy this backend to 5 pods...").
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: finmonitor-api
+  labels:
+    app: finmonitor-api
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: finmonitor-api
+  template:
+    metadata:
+      labels:
+        app: finmonitor-api
+    spec:
+      containers:
+        - name: api
+          image: finmonitor-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: INSTANCE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: Storage__Provider
+              value: "Sqlite"
+            - name: Storage__ConnectionString
+              value: "Data Source=/data/finmonitor.db"
+            - name: Redis__Enabled
+              value: "true"
+            - name: Redis__ConnectionString
+              value: "finmonitor-redis:6379,abortConnect=false"
+          volumeMounts:
+            - name: sqlite-data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: sqlite-data
+          persistentVolumeClaim:
+            claimName: finmonitor-sqlite-data
