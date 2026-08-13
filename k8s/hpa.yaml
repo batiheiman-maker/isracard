@@ -1,0 +1,32 @@
+# Horizontal Pod Autoscaler for the API deployment - a separate, additional concern from the
+# Redis/SQLite cross-pod sync fix (deployment.yaml + the ADR in README.md). Sync must be correct
+# BEFORE autoscaling makes sense: adding pods to a system that doesn't sync correctly would only
+# make the "pod A misses pod B's data" bug worse, not better.
+#
+# minReplicas: 3   - matches the docker-compose demo's baseline (also gives basic redundancy).
+# maxReplicas: 10  - a sensible ceiling for this MVP, not an enterprise-scale number.
+# target: 70% of the pod's requested memory (128Mi request from deployment.yaml, so scale-up
+#   triggers around ~90Mi average usage) - leaves headroom before hitting the 256Mi limit where
+#   the pod would otherwise be OOMKilled.
+#
+# Requires a metrics-server (or equivalent) running in the target cluster to report pod memory
+# usage; not verified against a live cluster in this assessment (same limitation as the rest of
+# k8s/ - see README.md).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: finmonitor-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: finmonitor-api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70

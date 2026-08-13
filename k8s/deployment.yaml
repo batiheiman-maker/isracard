@@ -1,6 +1,8 @@
 # Image is built from backend/src/FinMonitor.Api/Dockerfile (context: backend/src) and pushed
 # to whatever registry the target cluster pulls from; update `image:` accordingly.
-# `replicas: 5` mirrors the assignment's own framing ("if we deploy this backend to 5 pods...").
+# `replicas: 5` mirrors the assignment's own framing ("if we deploy this backend to 5 pods...")
+# and is just the starting point - once hpa.yaml is applied, the HorizontalPodAutoscaler takes
+# over this field and adjusts it (3-10) based on memory load.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

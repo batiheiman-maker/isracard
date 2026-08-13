@@ -56,7 +56,7 @@ flowchart LR
 | Real-time backplane | Redis (`Microsoft.AspNetCore.SignalR.StackExchangeRedis`) |
 | Frontend | React 19, TypeScript, Vite, React Router, `@microsoft/signalr`, framer-motion |
 | Containers | Docker (multi-stage, alpine), docker-compose, nginx |
-| Orchestration | Kubernetes manifests (Deployment/Service for API, Redis, frontend) |
+| Orchestration | Kubernetes manifests (Deployment/Service for API, Redis, frontend) + HorizontalPodAutoscaler |
 
 ## 4. Project structure
 
@@ -69,7 +69,7 @@ mid-fullstack-assessment/
 ├── frontend/                    # Vite + React + TypeScript
 ├── docker-compose.yml           # redis + 3 API replicas + nginx LB (distributed proof)
 ├── docker/nginx-lb.conf         # WS-aware load balancer config, round-robin
-├── k8s/                         # Deployment/Service manifests for api, redis, frontend
+├── k8s/                         # Deployment/Service manifests for api, redis, frontend + hpa.yaml
 └── scripts/hammer.ps1           # 100-rapid-POST load test (standalone, without the UI button)
 ```
 
@@ -231,6 +231,7 @@ reflect whatever that one pod happened to receive.
 | Distributed architecture - implemented | ✅ Redis backplane + shared SQLite; cross-process storage proven by `SqliteTransactionRepositoryTests`, full compose stack written but **not run live** (no working Docker engine in the build environment - see §6) |
 | Dockerfile, production-optimized | ✅ multi-stage, alpine, non-root, `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true` - written and reviewed, **not** built in this environment (same Docker-engine limitation) |
 | Kubernetes manifests | ✅ `k8s/deployment.yaml` + `service.yaml` (+ redis, frontend, PVC) - validated as YAML, **not** applied to a live cluster (none provisioned for this assessment) |
+| Horizontal autoscaling | ✅ `k8s/hpa.yaml` - 3-10 replicas, scales on 70% memory utilization. A separate concern from the sync fix: correctness across pods (Redis/SQLite) has to hold first, or autoscaling would just add more out-of-sync pods. Requires a metrics-server in the cluster; not verified live (same limitation as the rest of `k8s/`) |
 | UI animation on new transactions | ✅ row entrance fade/slide (framer-motion) |
 | UI animation on status change | ✅ CSS transition on the status badge |
 | List virtualization | ❌ deliberately skipped - batching + memoization is sufficient at this scale (see §11), and it fights row-level exit animations |
