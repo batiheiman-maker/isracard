@@ -44,7 +44,7 @@ flowchart LR
     mounted volume/PVC, so `GET /api/transactions` is consistent no matter which pod answers it.
 - **Cross-pod real-time sync**: SignalR's Redis backplane (`AddStackExchangeRedis`) so a
   broadcast from any pod reaches every connected client, regardless of which pod it's attached
-  to. See the [ADR](#9-adr-distributed-real-time-synchronization-across-pod-replicas) below.
+  to. See the [ADR](#10-adr-distributed-real-time-synchronization-across-pod-replicas) below.
 
 ## 3. Tech stack
 
@@ -157,7 +157,53 @@ repeat the curl loop - the dashboard will now visibly miss transactions served b
 than the one its WebSocket happens to be connected to. Re-enable it afterwards (it's `"true"` in
 the committed file).
 
-## 7. Run tests
+## 7. Run on Kubernetes
+
+> **Verified live** against Docker Desktop's built-in single-node cluster (`kind` under the
+> hood): all 8 manifests applied cleanly, 5 `finmonitor-api` pods came up from one `Deployment`
+> (no manual per-pod duplication - contrast with docker-compose's `api1`/`api2`/`api3`, which
+> exist as separate blocks specifically to give each one a distinct `X-Served-By` name; in k8s
+> each pod gets its instance name for free from the Downward API, `fieldRef: metadata.name`),
+> a `POST`/`GET` round-trip through 10 requests hit 4+ distinct pods, `GET /api/transactions`
+> showed all of them (shared PVC), and the dashboard received every one of them live regardless
+> of which pod served the POST.
+
+```bash
+docker build -t finmonitor-api:latest -f backend/src/FinMonitor.Api/Dockerfile backend/src
+docker build -t finmonitor-frontend:latest -f frontend/Dockerfile frontend
+kubectl apply -f k8s/
+kubectl get pods    # wait for all to reach 1/1 Running
+kubectl port-forward svc/finmonitor-frontend 8081:80
+```
+
+Open `http://localhost:8081/monitor`. (`kubectl port-forward` sidesteps any local port-80
+conflict, e.g. IIS or another service already bound to it on Windows - it's simpler and more
+reliable for local testing than relying on the `LoadBalancer` service's own port forwarding.)
+
+**The same SignalR stickiness issue as docker-compose, solved the k8s way:** a single
+`finmonitor-api` Service load-balances every request to a random pod per connection - fine for
+`/api/`, but the hub's `negotiate` call and its WebSocket/SSE upgrade need to land on the *same*
+pod. Kubernetes Services can't have different session affinity per URL path the way nginx's two
+upstream pools do, so instead there's a **second Service over the same pods**,
+`finmonitor-api-hub` (`k8s/service-hub.yaml`), with `sessionAffinity: ClientIP`. The frontend's
+`nginx.conf` routes `/hubs/` there and `/api/` to the plain `finmonitor-api` Service - same
+principle as `docker/nginx-lb.conf`, just expressed as two Services instead of two upstream
+blocks.
+
+**Storage note:** `k8s/sqlite-pvc.yaml` requests `ReadWriteOnce`, not `ReadWriteMany` as
+originally planned - this single-node local cluster's only storage class
+(`rancher.io/local-path`) doesn't support RWX, and since RWO is scoped per *node* (not per pod),
+multiple pods sharing it works fine here because there's only one node. A real multi-node
+production cluster would need an RWX-capable storage class (NFS, Azure Files, EFS) instead -
+documented directly in that file.
+
+**HPA note:** `kubectl get hpa` shows `memory: <unknown>/70%` - Docker Desktop's built-in cluster
+doesn't ship a metrics-server, so there's nothing reporting pod memory usage for the
+autoscaler to act on. Installing one (`kubectl apply -f https://.../metrics-server`) would let
+`k8s/hpa.yaml` actually scale; not done here since it's a cluster-wide addition beyond this
+assessment's scope.
+
+## 8. Run tests
 
 ```bash
 cd backend
@@ -175,10 +221,10 @@ claimed after the fact - the honest description of a single-session build.
 
 The assignment's unit-test requirement (§3) is scoped to backend processing/concurrency/storage;
 there's no frontend unit-test suite. The frontend is verified by `npm run build` (type-checked)
-and by manually driving both routes in a browser - see the [load-test verification](#8-load-test-verification)
+and by manually driving both routes in a browser - see the [load-test verification](#9-load-test-verification)
 section below for what that looked like in practice, including two real bugs it caught.
 
-## 8. Load-test verification
+## 9. Load-test verification
 
 The Simulator page (`/add`) has a **"Fire 100"** button that fires 100 concurrent POSTs from the
 browser and reports how many succeeded and how long it took - a live, demo-able proof of the "UI
@@ -203,7 +249,7 @@ assumed to work), which surfaced two real bugs before they shipped:
 Both were caught by actually running the "Fire 100" flow in a browser and checking the resulting
 DOM/state, not by inspection - which is the whole point of that button.
 
-## 9. ADR: Distributed Real-Time Synchronization Across Pod Replicas
+## 10. ADR: Distributed Real-Time Synchronization Across Pod Replicas
 
 **Context.** If this backend is deployed as N pod replicas behind a load balancer, a client's
 WebSocket connects to exactly one pod. By default, SignalR keeps its connected-client list in
@@ -252,21 +298,21 @@ reflect whatever that one pod happened to receive.
   would mean every developer needs SQLite/Docker running just to run the app once, for no benefit
   in the single-instance case where the distributed-storage problem doesn't exist yet.
 
-## 10. Bonus checklist
+## 11. Bonus checklist
 
 | Item | Status |
 |---|---|
 | Distributed architecture - described | ✅ (ADR above) |
 | Distributed architecture - implemented | ✅ Redis backplane + shared SQLite - **verified live** end-to-end via `docker compose up --build` (round-robin `X-Served-By`, shared GET snapshot, real-time browser delivery across pods - see §6) |
 | Dockerfile, production-optimized | ✅ multi-stage, alpine, non-root, `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true` - built and run live |
-| Kubernetes manifests | ✅ `k8s/deployment.yaml` + `service.yaml` (+ redis, frontend, PVC) - validated as YAML, **not** applied to a live cluster (none provisioned for this assessment) |
-| Horizontal autoscaling | ✅ `k8s/hpa.yaml` - 3-10 replicas, scales on 70% memory utilization. A separate concern from the sync fix: correctness across pods (Redis/SQLite) has to hold first, or autoscaling would just add more out-of-sync pods. Requires a metrics-server in the cluster; not verified live (same limitation as the rest of `k8s/`) |
+| Kubernetes manifests | ✅ **verified live** on Docker Desktop's built-in cluster - all 8 manifests applied, 5 `finmonitor-api` pods + 2 frontend pods + Redis all `1/1 Running`, PVC bound, round-robin + shared storage + real-time delivery all confirmed (see §7) |
+| Horizontal autoscaling | ✅ `k8s/hpa.yaml` - 3-10 replicas, scales on 70% memory utilization. A separate concern from the sync fix: correctness across pods (Redis/SQLite) has to hold first, or autoscaling would just add more out-of-sync pods. Applied live but shows `<unknown>` - Docker Desktop's cluster has no metrics-server installed (see §7) |
 | UI animation on new transactions | ✅ row entrance fade/slide (framer-motion) |
 | UI animation on status change | ✅ CSS transition on the status badge |
-| List virtualization | ❌ deliberately skipped - batching + memoization is sufficient at this scale (see §11), and it fights row-level exit animations |
+| List virtualization | ❌ deliberately skipped - batching + memoization is sufficient at this scale (see §12), and it fights row-level exit animations |
 | Redis/PVC high availability | ❌ future work, documented in the ADR |
 
-## 11. Known limitations / future work
+## 12. Known limitations / future work
 
 - No retention cap on the in-memory store (single-instance mode) - fine for an MVP demo session,
   would need eviction/paging for long-running use.

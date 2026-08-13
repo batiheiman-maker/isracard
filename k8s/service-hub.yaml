@@ -1,0 +1,17 @@
+# Separate Service for the SignalR hub only, pointing at the SAME pods as finmonitor-api but
+# with sessionAffinity: ClientIP. This is the k8s equivalent of the two-upstream-pool split in
+# docker/nginx-lb.conf: the negotiate handshake and the WebSocket/SSE/LongPolling upgrade must
+# land on the same pod (a SignalR requirement, unrelated to the Redis backplane - see the ADR
+# in README.md), while finmonitor-api (used for POST/GET /api/) stays sessionAffinity: None so
+# the round-robin distributed-sync proof over the ingestion path stays meaningful.
+apiVersion: v1
+kind: Service
+metadata:
+  name: finmonitor-api-hub
+spec:
+  selector:
+    app: finmonitor-api
+  sessionAffinity: ClientIP
+  ports:
+    - port: 8080
+      targetPort: 8080
