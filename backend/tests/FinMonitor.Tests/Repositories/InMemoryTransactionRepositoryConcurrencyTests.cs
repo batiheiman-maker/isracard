@@ -47,4 +47,36 @@ public class InMemoryTransactionRepositoryConcurrencyTests
 
         await act.Should().NotThrowAsync();
     }
+
+    [Fact]
+    public void TryAdd_BeyondCapacity_EvictsOldestFirst()
+    {
+        const int capacity = 5_000;
+        var repo = new InMemoryTransactionRepository();
+        var ids = Enumerable.Range(0, capacity + 1_000).Select(_ => Guid.NewGuid()).ToList();
+
+        // Sequential, not concurrent: eviction order is only meaningful relative to insertion
+        // order, which concurrent Task.Run scheduling wouldn't guarantee to match `ids`.
+        foreach (var id in ids)
+        {
+            repo.TryAdd(MakeTransaction(id));
+        }
+
+        repo.GetAll().Should().HaveCount(capacity);
+        ids.Take(1_000).Should().OnlyContain(id => repo.GetById(id) == null);
+        ids.TakeLast(capacity).Should().OnlyContain(id => repo.GetById(id) != null);
+    }
+
+    [Fact]
+    public async Task TryAdd_BeyondCapacity_UnderConcurrentLoad_NeverExceedsCapAndNeverThrows()
+    {
+        const int capacity = 5_000;
+        var repo = new InMemoryTransactionRepository();
+        var ids = Enumerable.Range(0, capacity + 1_000).Select(_ => Guid.NewGuid()).ToList();
+
+        Func<Task> act = () => Task.WhenAll(ids.Select(id => Task.Run(() => repo.TryAdd(MakeTransaction(id)))));
+
+        await act.Should().NotThrowAsync();
+        repo.GetAll().Count.Should().BeLessOrEqualTo(capacity);
+    }
 }

@@ -12,6 +12,11 @@ public sealed class TransactionValidator
     {
         var errors = new List<string>();
 
+        if (request.TransactionId == Guid.Empty)
+        {
+            errors.Add("transactionId is required.");
+        }
+
         if (request.Amount <= 0)
         {
             errors.Add("Amount must be greater than zero.");
@@ -31,7 +36,7 @@ public sealed class TransactionValidator
     }
 
     public Transaction Normalize(CreateTransactionRequest request) => new(
-        request.TransactionId ?? Guid.NewGuid(),
+        request.TransactionId,
         request.Amount,
         request.Currency.Trim().ToUpperInvariant(),
         request.Status,

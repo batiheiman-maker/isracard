@@ -22,6 +22,9 @@ public class TransactionServiceTests
     private static CreateTransactionRequest ValidRequest(Guid? id = null) =>
         new(id ?? Guid.NewGuid(), 100m, "USD", TransactionStatus.Completed, DateTimeOffset.UtcNow);
 
+    private static CreateTransactionRequest InvalidRequest() =>
+        new(Guid.Empty, 100m, "USD", TransactionStatus.Completed, DateTimeOffset.UtcNow);
+
     [Fact]
     public async Task CreateAsync_WithValidRequest_AddsTransactionAndBroadcastsExactlyOnce()
     {
@@ -48,14 +51,13 @@ public class TransactionServiceTests
     }
 
     [Fact]
-    public async Task CreateAsync_WhenTransactionIdOmitted_GeneratesNewGuid()
+    public async Task CreateAsync_WithEmptyTransactionId_ReturnsValidationFailedAndDoesNotCallRepositoryOrBroadcaster()
     {
-        _repository.Setup(r => r.TryAdd(It.IsAny<Transaction>())).Returns(true);
-        var request = new CreateTransactionRequest(null, 100m, "USD", TransactionStatus.Pending, null);
+        var result = await _sut.CreateAsync(InvalidRequest());
 
-        var result = await _sut.CreateAsync(request);
-
-        result.Transaction!.TransactionId.Should().NotBe(Guid.Empty);
+        result.Outcome.Should().Be(CreateTransactionOutcome.ValidationFailed);
+        _repository.Verify(r => r.TryAdd(It.IsAny<Transaction>()), Times.Never);
+        _broadcaster.Verify(b => b.BroadcastAsync(It.IsAny<Transaction>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]

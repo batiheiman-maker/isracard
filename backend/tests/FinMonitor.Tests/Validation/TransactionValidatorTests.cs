@@ -91,12 +91,13 @@ public class TransactionValidatorTests
     }
 
     [Fact]
-    public void Normalize_WithMissingTransactionId_GeneratesNewGuid()
+    public void Validate_WithEmptyTransactionId_ReturnsInvalidWithTransactionIdError()
     {
-        var request = new CreateTransactionRequest(null, 10, "USD", TransactionStatus.Pending, null);
+        var request = new CreateTransactionRequest(Guid.Empty, 10, "USD", TransactionStatus.Pending, null);
 
-        var normalized = Validator.Normalize(request);
+        var result = Validator.Validate(request);
 
-        normalized.TransactionId.Should().NotBe(Guid.Empty);
+        result.IsValid.Should().BeFalse();
+        result.Errors.Should().Contain(e => e.Contains("transactionId"));
     }
 }

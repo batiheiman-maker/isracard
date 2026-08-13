@@ -14,7 +14,7 @@ export function TransactionForm({ onSubmit, submitting }: TransactionFormProps) 
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
-    await onSubmit({ amount: Number(amount), currency, status });
+    await onSubmit({ transactionId: crypto.randomUUID(), amount: Number(amount), currency, status });
   }
 
   return (

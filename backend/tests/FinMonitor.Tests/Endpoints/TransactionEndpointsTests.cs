@@ -37,7 +37,7 @@ public class TransactionEndpointsTests : IClassFixture<WebApplicationFactory<Pro
 
         response.StatusCode.Should().Be(HttpStatusCode.Created);
         var created = await response.Content.ReadFromJsonAsync<Transaction>(JsonOptions);
-        created!.TransactionId.Should().Be(request.TransactionId!.Value);
+        created!.TransactionId.Should().Be(request.TransactionId);
     }
 
     [Fact]
@@ -45,6 +45,17 @@ public class TransactionEndpointsTests : IClassFixture<WebApplicationFactory<Pro
     {
         var client = _factory.CreateClient();
         var request = new CreateTransactionRequest(Guid.NewGuid(), -5, "USD", TransactionStatus.Completed, DateTimeOffset.UtcNow);
+
+        var response = await client.PostAsJsonAsync("/api/transactions", request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+    }
+
+    [Fact]
+    public async Task PostTransactions_WithEmptyTransactionId_Returns400()
+    {
+        var client = _factory.CreateClient();
+        var request = new CreateTransactionRequest(Guid.Empty, 42.50m, "USD", TransactionStatus.Completed, DateTimeOffset.UtcNow);
 
         var response = await client.PostAsJsonAsync("/api/transactions", request);
 

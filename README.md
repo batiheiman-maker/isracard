@@ -39,7 +39,10 @@ flowchart LR
   it over SignalR.
 - **Real-time layer**: SignalR hub (`/hubs/transactions`), push-only.
 - **Storage**: two modes behind the same `ITransactionRepository` interface -
-  - *Single instance / local dev*: `InMemoryTransactionRepository` (`ConcurrentDictionary`).
+  - *Single instance / local dev*: `InMemoryTransactionRepository` (`ConcurrentDictionary`),
+    capped at the 5,000 most recent transactions - it represents "latest transactions", not a
+    historical record, so once full it evicts the oldest entry per new insert (a `ConcurrentQueue`
+    tracks insertion order for O(1) eviction) rather than growing without bound.
   - *Distributed (compose/k8s)*: `PostgresTransactionRepository`, a shared PostgreSQL database
     every pod connects to as a normal network client, so `GET /api/transactions` is consistent
     no matter which pod answers it. (An earlier design shared a SQLite file over a mounted
@@ -235,10 +238,13 @@ cd backend
 dotnet test tests/FinMonitor.Tests/FinMonitor.Tests.csproj
 ```
 
-32 tests covering validation, repository concurrency (in-memory, and Postgres via Testcontainers
+35 tests covering validation, repository concurrency (in-memory, and Postgres via Testcontainers
 - a real, disposable Postgres container per test, not a mock), the service layer, and the HTTP
-endpoints end-to-end via `WebApplicationFactory`. Requires Docker to be running (Testcontainers
-needs it to spin up Postgres); everything else runs without it.
+endpoints end-to-end via `WebApplicationFactory`. The 6 Postgres/Testcontainers tests need Docker
+to spin up a real container; a `[DockerRequiredFact]` attribute (`tests/.../DockerRequiredFactAttribute.cs`)
+checks `docker info` once at test discovery and marks them `Skipped` - not failed - if Docker
+isn't reachable, so the full suite is still "executable automatically" (per the assignment's
+Unit Tests requirement) in an environment without Docker; the other 29 tests never depend on it.
 
 **On the TDD process**: tests were written before their corresponding implementation, one
 component at a time (Validator → Repository/concurrency → Service → Endpoints), confirmed to
@@ -364,8 +370,6 @@ solve it, and no amount of extra locking code in this repo would have changed th
 
 ## 12. Known limitations / future work
 
-- No retention cap on the in-memory store (single-instance mode) - fine for an MVP demo session,
-  would need eviction/paging for long-running use.
 - The frontend caps its rendered window at the 500 most recent transactions
   (`MAX_TRANSACTIONS` in `useTransactionStream.ts`) to bound DOM size under sustained load.
 - No authentication/authorization on the ingestion API - out of scope for this assessment but

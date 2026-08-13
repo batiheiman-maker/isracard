@@ -17,14 +17,17 @@ public class PostgresTransactionRepositoryTests : IAsyncLifetime
 
     private string ConnectionString => _container.GetConnectionString();
 
-    public Task InitializeAsync() => _container.StartAsync();
+    // Guarded even though [DockerRequiredFact] already prevents these tests from running at all
+    // without Docker - defense in depth, in case a future xUnit version invokes IAsyncLifetime
+    // before checking Skip.
+    public Task InitializeAsync() => DockerAvailability.IsAvailable ? _container.StartAsync() : Task.CompletedTask;
 
-    public Task DisposeAsync() => _container.DisposeAsync().AsTask();
+    public Task DisposeAsync() => DockerAvailability.IsAvailable ? _container.DisposeAsync().AsTask() : Task.CompletedTask;
 
     private static Transaction MakeTransaction(Guid? id = null, decimal amount = 100m) => new(
         id ?? Guid.NewGuid(), amount, "USD", TransactionStatus.Completed, DateTimeOffset.UtcNow);
 
-    [Fact]
+    [DockerRequiredFact]
     public async Task TryAdd_NewTransaction_ReturnsTrueAndCanBeRetrievedById()
     {
         var repo = await PostgresTransactionRepository.CreateAsync(ConnectionString);
@@ -44,7 +47,7 @@ public class PostgresTransactionRepositoryTests : IAsyncLifetime
         retrieved.Timestamp.Should().BeCloseTo(transaction.Timestamp, TimeSpan.FromMilliseconds(1));
     }
 
-    [Fact]
+    [DockerRequiredFact]
     public async Task TryAdd_DuplicateTransactionId_ReturnsFalseAndDoesNotOverwrite()
     {
         var repo = await PostgresTransactionRepository.CreateAsync(ConnectionString);
@@ -57,7 +60,7 @@ public class PostgresTransactionRepositoryTests : IAsyncLifetime
         repo.GetById(id)!.Amount.Should().Be(100m);
     }
 
-    [Fact]
+    [DockerRequiredFact]
     public async Task GetById_UnknownId_ReturnsNull()
     {
         var repo = await PostgresTransactionRepository.CreateAsync(ConnectionString);
@@ -65,7 +68,7 @@ public class PostgresTransactionRepositoryTests : IAsyncLifetime
         repo.GetById(Guid.NewGuid()).Should().BeNull();
     }
 
-    [Fact]
+    [DockerRequiredFact]
     public async Task DataWrittenByOneInstance_IsVisibleToAnotherInstanceOnSameDatabase_SimulatingSharedDbAcrossPods()
     {
         var podA = await PostgresTransactionRepository.CreateAsync(ConnectionString);
@@ -80,7 +83,7 @@ public class PostgresTransactionRepositoryTests : IAsyncLifetime
         podB.GetAll().Should().ContainSingle();
     }
 
-    [Fact]
+    [DockerRequiredFact]
     public async Task TryAdd_With200ConcurrentUniqueTransactionsAcrossMultipleInstances_AllStoredWithNoLostUpdates()
     {
         var ids = Enumerable.Range(0, 200).Select(_ => Guid.NewGuid()).ToList();
@@ -93,7 +96,7 @@ public class PostgresTransactionRepositoryTests : IAsyncLifetime
         ids.Should().OnlyContain(id => verifier.GetById(id) != null);
     }
 
-    [Fact]
+    [DockerRequiredFact]
     public async Task TryAdd_With50ConcurrentDuplicateTransactionIds_OnlyOneSucceeds()
     {
         var id = Guid.NewGuid();

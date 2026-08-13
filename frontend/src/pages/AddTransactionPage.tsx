@@ -8,6 +8,7 @@ const CURRENCIES = ["USD", "EUR", "GBP", "ILS"];
 
 function randomRequest(): CreateTransactionRequest {
   return {
+    transactionId: crypto.randomUUID(),
     amount: Math.round((Math.random() * 10000 + 1) * 100) / 100,
     currency: CURRENCIES[Math.floor(Math.random() * CURRENCIES.length)],
     status: TRANSACTION_STATUSES[Math.floor(Math.random() * TRANSACTION_STATUSES.length)] as TransactionStatus,

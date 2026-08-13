@@ -9,7 +9,7 @@ export interface Transaction {
 }
 
 export interface CreateTransactionRequest {
-  transactionId?: string;
+  transactionId: string;
   amount: number;
   currency: string;
   status: TransactionStatus;
