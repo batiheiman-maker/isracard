@@ -63,14 +63,18 @@ flowchart LR
 ```
 mid-fullstack-assessment/
 ├── backend/
-│   ├── src/FinMonitor.Domain/   # model, validation, repositories, service - no ASP.NET/SignalR refs
-│   └── src/FinMonitor.Api/      # Program.cs, endpoints, hub, Dockerfile
-│   └── tests/FinMonitor.Tests/  # xUnit
-├── frontend/                    # Vite + React + TypeScript
-├── docker-compose.yml           # redis + 3 API replicas + nginx LB (distributed proof)
-├── docker/nginx-lb.conf         # WS-aware load balancer config, round-robin
-├── k8s/                         # Deployment/Service manifests for api, redis, frontend + hpa.yaml
-└── scripts/hammer.ps1           # 100-rapid-POST load test (standalone, without the UI button)
+│   ├── src/FinMonitor.Api/       # single project: Program.cs, endpoints, hub, Dockerfile,
+│   │   ├── Models/, DTOs/        # plus model/validation/repository/service layers below,
+│   │   ├── Validation/           # organized by folder/namespace rather than a separate
+│   │   ├── Repositories/         # project - FinMonitor.Domain.* namespaces are kept for
+│   │   ├── Services/             # clarity even though everything now lives in one project
+│   │   └── Realtime/, Endpoints/, Hubs/, Middleware/
+│   └── tests/FinMonitor.Tests/   # xUnit
+├── frontend/                     # Vite + React + TypeScript
+├── docker-compose.yml            # redis + 3 API replicas + nginx LB (distributed proof)
+├── docker/nginx-lb.conf          # WS-aware load balancer config, round-robin
+├── k8s/                          # Deployment/Service manifests for api, redis, frontend + hpa.yaml
+└── scripts/hammer.ps1            # 100-rapid-POST load test (standalone, without the UI button)
 ```
 
 ## 5. Run locally (single instance)

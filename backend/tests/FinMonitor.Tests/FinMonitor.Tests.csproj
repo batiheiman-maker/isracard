@@ -24,7 +24,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\FinMonitor.Domain\FinMonitor.Domain.csproj" />
     <ProjectReference Include="..\..\src\FinMonitor.Api\FinMonitor.Api.csproj" />
   </ItemGroup>
 
