@@ -94,15 +94,35 @@ another tab to watch them arrive live. Vite's dev server proxies `/api` and `/hu
 
 ## 6. Run the distributed proof (docker-compose)
 
-> **Note on this build's verification:** the compose stack below was written and reviewed but
-> could not be run live in the environment this was built in - Docker Desktop's WSL2 backend had
-> no Linux distribution installed (`wsl -l -v` reported none) and couldn't be brought up. The
-> distributed-storage mechanism it depends on *is* verified independently:
-> `SqliteTransactionRepositoryTests.TryAdd_With200ConcurrentUniqueTransactionsAcrossMultipleInstances_AllStoredWithNoLostUpdates`
-> runs 200 concurrent writes from many separate `SqliteTransactionRepository` instances against
-> one shared file and confirms no lost or duplicate writes - the exact cross-process behavior the
-> distributed mode relies on, exercised without needing containers. Run `docker compose up --build`
-> yourself to see the full multi-pod proof end-to-end.
+> **Verified live.** `docker compose up --build` was run end-to-end: 6 sequential POSTs to
+> `http://localhost:8080/api/transactions` came back with `X-Served-By: api1/api2/api3` cycling
+> in strict round-robin, `GET /api/transactions` showed all of them regardless of which pod
+> served each POST (shared SQLite), and a browser connected to `/monitor` received every one of
+> them in real time over the SignalR/Redis backplane as they arrived - confirmed via the browser
+> console and DOM, not just by inspection.
+>
+> Three real bugs surfaced and were fixed while getting this to work, in case you hit the same
+> ones on a different machine:
+> 1. `.dockerignore` was at `backend/.dockerignore`, but the build context (per
+>    `docker-compose.yml`) is `backend/src` - Docker only honors a `.dockerignore` at the context
+>    root, so it was silently ignored and stale `obj/` folders from local Windows `dotnet build`
+>    runs leaked into the image, overwriting the fresh Linux restore output with one containing a
+>    Windows-only NuGet fallback path and breaking `dotnet publish`. Fixed by moving it to
+>    `backend/src/.dockerignore`.
+> 2. The shared SQLite volume (`/data`) is root-owned by default when Docker creates it, but the
+>    container runs as non-root `appuser` -> `SQLite Error 14: unable to open database file`.
+>    Fixed with `docker-entrypoint.sh`, which `chown`s `/data` while still root, then drops to
+>    `appuser` via `su-exec` before running the app.
+> 3. **The interesting one**: the dashboard couldn't connect to the hub at all through the LB
+>    (`WebSocket failed to connect... check that sticky sessions are enabled`). This is a
+>    real, separate SignalR requirement, not a bug in the Redis backplane itself - SignalR's
+>    `negotiate` call and the follow-up WebSocket/SSE/LongPolling upgrade must land on the *same*
+>    server, because the connection id only exists in that one process's memory; the Redis
+>    backplane broadcasts *messages* between already-connected clients across pods, it doesn't
+>    (and can't) share a live in-process transport handle. Fixed with **two separate upstream
+>    pools** in `docker/nginx-lb.conf`: `/hubs/` uses `ip_hash` (sticky, required for the
+>    handshake), `/api/` stays plain round-robin (not sticky - this is the exact path the bonus
+>    is about, and it has to stay non-sticky for the proof to mean anything).
 
 ```bash
 docker compose up --build
@@ -215,8 +235,13 @@ reflect whatever that one pod happened to receive.
   at that point without changing `ITransactionRepository`'s shape.
 
 **Alternatives considered.**
-- *Sticky sessions* (route a client to the same pod every time): rejected - it hides the bug
-  rather than fixing it, and defeats the point of load balancing.
+- *Sticky sessions for the ingestion API* (`POST /api/transactions`, route a client to the same
+  pod every time): rejected - it would hide the exact bug this ADR solves rather than fixing it.
+  Note this is a *different* question from whether the SignalR *hub connection itself* needs
+  stickiness - it does, for an unrelated reason (see the implementation note in §6): the
+  `negotiate` handshake and the transport upgrade must land on the same process. That's handled
+  at the load-balancer level (`ip_hash` on the `/hubs/` upstream only) and doesn't touch the
+  ingestion path, so the round-robin proof over `/api/` stays meaningful.
 - *Client-side polling instead of push*: rejected - contradicts the "instant" real-time
   requirement outright.
 - *Shared external store from the start* (skip in-memory entirely): rejected for local dev - it
@@ -228,8 +253,8 @@ reflect whatever that one pod happened to receive.
 | Item | Status |
 |---|---|
 | Distributed architecture - described | ✅ (ADR above) |
-| Distributed architecture - implemented | ✅ Redis backplane + shared SQLite; cross-process storage proven by `SqliteTransactionRepositoryTests`, full compose stack written but **not run live** (no working Docker engine in the build environment - see §6) |
-| Dockerfile, production-optimized | ✅ multi-stage, alpine, non-root, `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true` - written and reviewed, **not** built in this environment (same Docker-engine limitation) |
+| Distributed architecture - implemented | ✅ Redis backplane + shared SQLite - **verified live** end-to-end via `docker compose up --build` (round-robin `X-Served-By`, shared GET snapshot, real-time browser delivery across pods - see §6) |
+| Dockerfile, production-optimized | ✅ multi-stage, alpine, non-root, `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true` - built and run live |
 | Kubernetes manifests | ✅ `k8s/deployment.yaml` + `service.yaml` (+ redis, frontend, PVC) - validated as YAML, **not** applied to a live cluster (none provisioned for this assessment) |
 | Horizontal autoscaling | ✅ `k8s/hpa.yaml` - 3-10 replicas, scales on 70% memory utilization. A separate concern from the sync fix: correctness across pods (Redis/SQLite) has to hold first, or autoscaling would just add more out-of-sync pods. Requires a metrics-server in the cluster; not verified live (same limitation as the rest of `k8s/`) |
 | UI animation on new transactions | ✅ row entrance fade/slide (framer-motion) |

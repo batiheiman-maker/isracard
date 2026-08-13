@@ -12,10 +12,11 @@ RUN dotnet publish FinMonitor.Api/FinMonitor.Api.csproj -c Release -o /app --no-
 
 FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine AS final
 WORKDIR /app
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+RUN apk add --no-cache su-exec && addgroup -S appgroup && adduser -S appuser -G appgroup
 ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true
 ENV ASPNETCORE_URLS=http://+:8080
 COPY --from=build /app .
-USER appuser
+COPY FinMonitor.Api/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 EXPOSE 8080
-ENTRYPOINT ["dotnet", "FinMonitor.Api.dll"]
+ENTRYPOINT ["docker-entrypoint.sh"]
