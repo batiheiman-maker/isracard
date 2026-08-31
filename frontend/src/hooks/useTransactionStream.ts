@@ -11,10 +11,23 @@ const FLUSH_INTERVAL_MS = 120;
 // correct order) - a short debounce lets a merely-reordered item arrive and close the "gap" on
 // its own before this fires a network round trip for something that was never actually lost.
 const GAP_CHECK_DEBOUNCE_MS = 500;
-// Sanity ceiling on how many chained /since/{sequence} calls one catch-up will make - the loop
-// already terminates naturally once a call returns nothing, this only guards against an
-// unbounded request storm if that contract were ever violated.
-const MAX_CATCH_UP_ITERATIONS = 20;
+// Sanity ceiling on how many chained /since/{sequence} calls ONE pass will make.
+export const MAX_CATCH_UP_ITERATIONS = 20;
+// Sanity ceiling on how many passes a single catch-up chain will chain together when each pass
+// keeps coming back "there's probably more" (hit MAX_CATCH_UP_ITERATIONS with the last batch
+// still non-empty) or another trigger coalesced in while it ran. Bounds worst-case chained
+// /since calls to MAX_CATCH_UP_RESUME_CYCLES * MAX_CATCH_UP_ITERATIONS (100 in the default
+// configuration) before falling back to a full snapshot resync (resyncFromSnapshot) instead of
+// continuing to chase an ever-growing backlog indefinitely.
+export const MAX_CATCH_UP_RESUME_CYCLES = 5;
+// Brief pause between chained passes within one catch-up chain - distinct from
+// GAP_CHECK_DEBOUNCE_MS (which exists to let reordered live pushes settle, not to pace backlog
+// draining) so tuning one doesn't silently retune the other.
+export const CATCH_UP_RESUME_DELAY_MS = 500;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
 
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting" | "disconnected";
 
@@ -35,6 +48,11 @@ export function useTransactionStream() {
   // later, smaller gap never overwrites an already-pending earlier one (the earlier range is a
   // superset of the later one).
   const gapSinceSequenceRef = useRef<number | null>(null);
+  // Single-flight guards for catchUpFrom below: catchUpInFlightRef is true while any chain (one
+  // or more passes) is running; catchUpPendingRef records "something asked for another look
+  // while busy" so that demand isn't lost without spawning a second parallel chain.
+  const catchUpInFlightRef = useRef(false);
+  const catchUpPendingRef = useRef(false);
 
   const flush = useCallback(() => {
     flushTimerRef.current = null;
@@ -53,7 +71,15 @@ export function useTransactionStream() {
     });
     if (fresh.length === 0) return;
 
-    setTransactions((prev) => [...fresh.reverse(), ...prev].slice(0, MAX_TRANSACTIONS));
+    // Merge and sort by sequence rather than assuming arrival order equals sequence order: a
+    // catch-up batch delivers items OLDER than what's already rendered (it fills gaps below an
+    // already-shown, higher-sequence live push), so blindly prepending it - as a plain
+    // reverse-and-prepend would - puts older transactions visually above newer ones.
+    setTransactions((prev) => {
+      const merged = [...fresh, ...prev];
+      merged.sort((a, b) => b.sequence - a.sequence);
+      return merged.slice(0, MAX_TRANSACTIONS);
+    });
   }, []);
 
   // Pushes a batch into the render queue and advances lastSequenceRef, but does no gap
@@ -74,12 +100,12 @@ export function useTransactionStream() {
     [flush],
   );
 
-  // /since/{sequence} is capped server-side (MaxCatchUpBatch, currently 1000) - a single call
-  // can't be assumed to close a gap larger than that. Keeps pulling from the highest sequence
-  // actually returned until a call comes back empty, without needing to know the server's cap
-  // value: a full-looking batch just means "ask again from here," not "that was everything."
-  const catchUpFrom = useCallback(
-    async (sinceSequence: number) => {
+  // One bounded pass: chains /since calls from sinceSequence until a call returns empty (nothing
+  // more missing) or the per-pass cap is hit. Returns the highest sequence this pass itself
+  // confirmed, and whether the cap was hit while data was still flowing (every call in this pass
+  // came back non-empty) - the single-flight controller below decides whether to resume.
+  const runCatchUpPass = useCallback(
+    async (sinceSequence: number): Promise<{ since: number; moreLikelyPending: boolean }> => {
       let since = sinceSequence;
       for (let i = 0; i < MAX_CATCH_UP_ITERATIONS; i++) {
         let missed: Transaction[];
@@ -88,14 +114,85 @@ export function useTransactionStream() {
         } catch {
           // Best-effort: whatever's still missing will be caught by the next live push's gap
           // check, or the next reconnect.
-          return;
+          return { since, moreLikelyPending: false };
         }
-        if (missed.length === 0) return;
+        if (missed.length === 0) return { since, moreLikelyPending: false };
         enqueueMany(missed);
         since = missed.reduce((max, t) => Math.max(max, t.sequence), since);
       }
+      return { since, moreLikelyPending: true };
     },
     [enqueueMany],
+  );
+
+  // Falls back to a full refresh via getTransactions() (the same call the initial mount uses)
+  // when a catch-up chain exhausts MAX_CATCH_UP_RESUME_CYCLES without ever catching up - giving
+  // up silently there would just reproduce the original permanent-incompleteness problem at a
+  // larger threshold. Routes the result through enqueueMany rather than replacing state
+  // directly: getTransactions() takes real time to resolve, and a live SignalR push can arrive
+  // while it's in flight. A blind replace once it resolves would risk erasing that
+  // already-received live transaction (if the snapshot was read just before the live write
+  // became visible) and could regress lastSequenceRef backward. Merging via enqueueMany makes
+  // that structurally impossible instead of merely unlikely: lastSequenceRef only ever advances
+  // (Math.max, per item), seenIdsRef only ever grows, and flush()'s sort-by-sequence-descending
+  // merges the snapshot with whatever's already rendered rather than discarding it.
+  const resyncFromSnapshot = useCallback(async () => {
+    try {
+      const { items: snapshot } = await getTransactions();
+      enqueueMany(snapshot);
+    } catch {
+      // Best-effort: if even the fallback snapshot fails, the next live push's own gap check (or
+      // the next reconnect) will try catch-up again from wherever lastSequenceRef already is.
+    }
+  }, [enqueueMany]);
+
+  // /since/{sequence} is capped server-side - a single call, or even one bounded pass, can't be
+  // assumed to close an arbitrarily large gap. This is the single-flight controller: gap
+  // detection, reconnect, and pass-exhaustion resumption all funnel through here, and at most
+  // one chain of passes ever runs at a time. A caller that arrives while a chain is already
+  // running doesn't start a second parallel chain - it just marks that another look is wanted
+  // (catchUpPendingRef), which the running chain picks up on its own next cycle using the
+  // chain's own accumulated `since` (never the coalesced caller's, which is always >= where the
+  // chain already is, and would risk skipping a range never delivered live).
+  //
+  // Not async: if it were, its returned Promise would resolve right after the synchronous
+  // claim-or-coalesce check, well before the real work (which runs in an unawaited IIFE)
+  // finishes - a misleading signal. Plain void return makes "fire-and-forget" explicit.
+  const catchUpFrom = useCallback(
+    (sinceSequence: number): void => {
+      if (catchUpInFlightRef.current) {
+        catchUpPendingRef.current = true;
+        return;
+      }
+      catchUpInFlightRef.current = true;
+      catchUpPendingRef.current = false;
+
+      void (async () => {
+        let since = sinceSequence;
+        let exhausted = false;
+        for (let cycle = 0; cycle < MAX_CATCH_UP_RESUME_CYCLES; cycle++) {
+          catchUpPendingRef.current = false;
+          const result = await runCatchUpPass(since);
+          since = result.since;
+
+          const shouldResume = result.moreLikelyPending || catchUpPendingRef.current;
+          if (!shouldResume) break;
+          if (cycle === MAX_CATCH_UP_RESUME_CYCLES - 1) {
+            exhausted = true;
+            break;
+          }
+          await delay(CATCH_UP_RESUME_DELAY_MS);
+        }
+
+        if (exhausted) {
+          await resyncFromSnapshot();
+        }
+
+        catchUpInFlightRef.current = false;
+        catchUpPendingRef.current = false;
+      })();
+    },
+    [runCatchUpPass, resyncFromSnapshot],
   );
 
   // Debounced gap detection: fetches everything after `sinceSequence` once the window closes
@@ -114,7 +211,7 @@ export function useTransactionStream() {
         const since = gapSinceSequenceRef.current;
         gapSinceSequenceRef.current = null;
         if (since === null) return;
-        void catchUpFrom(since);
+        catchUpFrom(since);
       }, GAP_CHECK_DEBOUNCE_MS);
     },
     [catchUpFrom],
@@ -155,7 +252,7 @@ export function useTransactionStream() {
     connection.onreconnected(() => {
       if (!isMounted) return;
       setStatus("connected");
-      void catchUpFrom(lastSequenceRef.current);
+      catchUpFrom(lastSequenceRef.current);
     });
 
     (async () => {
