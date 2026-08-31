@@ -7,15 +7,17 @@ namespace FinMonitor.Api.Realtime;
 
 public sealed class SignalRTransactionBroadcaster : ITransactionBroadcaster
 {
-    public const string TransactionReceivedEvent = "TransactionReceived";
+    private readonly IHubContext<TransactionHub, ITransactionClient> _hubContext;
 
-    private readonly IHubContext<TransactionHub> _hubContext;
-
-    public SignalRTransactionBroadcaster(IHubContext<TransactionHub> hubContext)
+    public SignalRTransactionBroadcaster(IHubContext<TransactionHub, ITransactionClient> hubContext)
     {
         _hubContext = hubContext;
     }
 
+    // cancellationToken isn't forwarded to the send itself: ITransactionClient's methods describe
+    // what a client receives, not a place to smuggle in a cancellation signal for the server-side
+    // send operation - those are different concerns. TransactionBroadcastWorker's own stoppingToken
+    // still governs whether a broadcast is attempted at all (see its ExecuteAsync loop).
     public Task BroadcastAsync(Transaction transaction, CancellationToken cancellationToken = default) =>
-        _hubContext.Clients.All.SendAsync(TransactionReceivedEvent, transaction, cancellationToken);
+        _hubContext.Clients.All.TransactionReceived(transaction);
 }

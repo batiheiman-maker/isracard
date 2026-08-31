@@ -1,6 +1,6 @@
 using FinMonitor.Domain.Models;
 
-namespace FinMonitor.Domain.Services;
+namespace FinMonitor.Domain.Results;
 
 public enum CreateTransactionOutcome
 {

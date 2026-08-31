@@ -105,12 +105,13 @@ another tab to watch them arrive live. Vite's dev server proxies `/api` and `/hu
 ## 6. Run the distributed proof (docker-compose)
 
 > **Verified live.** `docker compose up --build` was run end-to-end: 6 sequential POSTs to
-> `http://localhost:8080/api/transactions` came back with `X-Served-By: api1/api2/api3` cycling
-> in strict round-robin, `GET /api/transactions` showed all of them regardless of which pod
-> served each POST (shared Postgres, confirmed both via the API and by querying Postgres
-> directly), and a browser connected to `/monitor` received every one of them in real time over
-> the SignalR/Redis backplane as they arrived - confirmed via the browser console and DOM, not
-> just by inspection.
+> `http://localhost:8080/api/transactions` succeeded, `GET /api/transactions` showed all of them
+> regardless of which pod served each POST (shared Postgres, confirmed both via the API and by
+> querying Postgres directly), and a browser connected to `/monitor` received every one of them
+> in real time over the SignalR/Redis backplane as they arrived - confirmed via the browser
+> console and DOM, not just by inspection. nginx's `/api/` upstream (`docker/nginx-lb.conf`) is
+> plain round-robin across the three replicas, no sticky sessions - see item 2 below for why
+> `/hubs/` needs the opposite.
 >
 > Real bugs surfaced and were fixed while getting this to work, in case you hit the same ones on
 > a different machine:
@@ -155,16 +156,16 @@ Open `http://localhost:8080/monitor`, then from a shell:
 
 ```bash
 for i in $(seq 1 10); do
-  curl -s -i -X POST http://localhost:8080/api/transactions \
+  curl -s -X POST http://localhost:8080/api/transactions \
     -H "Content-Type: application/json" \
-    -d "{\"amount\": $i, \"currency\": \"USD\", \"status\": \"Completed\"}" \
-    | grep -i x-served-by
+    -d "{\"amount\": $i, \"currency\": \"USD\", \"status\": \"Completed\"}"
 done
 ```
 
-You'll see `X-Served-By` vary across `api1`/`api2`/`api3` (proving round-robin, no sticky
-sessions), while the dashboard still shows all 10 transactions regardless of which pod served
-each POST - proving the Redis backplane fan-out works.
+nginx round-robins these across `api1`/`api2`/`api3` with no sticky sessions on `/api/`. Watch
+the dashboard - it picks up all 10 in real time regardless of which pod happened to handle each
+POST, which is the actual proof the Redis backplane fan-out works: without it, only broadcasts
+from whichever pod your browser's WebSocket is connected to would show up.
 
 **Before/after, to see the bug the backplane fixes:** set `Redis__Enabled: "false"` for the
 `api1`/`api2`/`api3` services in `docker-compose.yml`, `docker compose up --build` again, and
@@ -176,12 +177,12 @@ the committed file).
 
 > **Verified live** against Docker Desktop's built-in single-node cluster (`kind` under the
 > hood): all 11 manifests applied cleanly, 5 `finmonitor-api` pods came up from one `Deployment`
-> (no manual per-pod duplication - contrast with docker-compose's `api1`/`api2`/`api3`, which
-> exist as separate blocks specifically to give each one a distinct `X-Served-By` name; in k8s
-> each pod gets its instance name for free from the Downward API, `fieldRef: metadata.name`), a
-> `POST`/`GET` round-trip through requests hit multiple distinct pods, `GET /api/transactions`
-> and a direct `psql` query against the Postgres pod agreed on the exact same count, and the
-> dashboard received every transaction live regardless of which pod served the POST.
+> (no manual per-pod duplication needed the way docker-compose's `api1`/`api2`/`api3` blocks
+> are - a single k8s Service round-robins across however many pods the Deployment has),
+> `GET /api/transactions` and a direct `psql` query against the Postgres pod agreed on the exact
+> same count, and the dashboard received every transaction live regardless of which pod served
+> the POST - the same distributed guarantees as docker-compose, this time behind a real
+> Kubernetes Service.
 
 ```bash
 docker build -t finmonitor-api:latest -f backend/src/FinMonitor.Api/Dockerfile backend/src
@@ -238,13 +239,15 @@ cd backend
 dotnet test tests/FinMonitor.Tests/FinMonitor.Tests.csproj
 ```
 
-35 tests covering validation, repository concurrency (in-memory, and Postgres via Testcontainers
-- a real, disposable Postgres container per test, not a mock), the service layer, and the HTTP
-endpoints end-to-end via `WebApplicationFactory`. The 6 Postgres/Testcontainers tests need Docker
-to spin up a real container; a `[DockerRequiredFact]` attribute (`tests/.../DockerRequiredFactAttribute.cs`)
-checks `docker info` once at test discovery and marks them `Skipped` - not failed - if Docker
-isn't reachable, so the full suite is still "executable automatically" (per the assignment's
-Unit Tests requirement) in an environment without Docker; the other 29 tests never depend on it.
+43 tests covering validation, repository concurrency and pagination/sequence behavior (in-memory,
+and Postgres via Testcontainers - a real, disposable Postgres container per test, not a mock),
+the service layer (including the broadcast queue), and the HTTP endpoints end-to-end via
+`WebApplicationFactory` (including pagination and the `/since/{sequence}` catch-up route). The
+8 Postgres/Testcontainers tests need Docker to spin up a real container; a `[DockerRequiredFact]`
+attribute (`tests/.../DockerRequiredFactAttribute.cs`) checks `docker info` once at test discovery
+and marks them `Skipped` - not failed - if Docker isn't reachable, so the full suite is still
+"executable automatically" (per the assignment's Unit Tests requirement) in an environment
+without Docker; the other 35 tests never depend on it.
 
 **On the TDD process**: tests were written before their corresponding implementation, one
 component at a time (Validator → Repository/concurrency → Service → Endpoints), confirmed to
@@ -359,7 +362,7 @@ solve it, and no amount of extra locking code in this repo would have changed th
 | Item | Status |
 |---|---|
 | Distributed architecture - described | ✅ (ADR above) |
-| Distributed architecture - implemented | ✅ Redis backplane + shared Postgres - **verified live** end-to-end via both `docker compose up --build` and a real Kubernetes deployment (round-robin `X-Served-By`, shared storage confirmed via direct DB query, real-time browser delivery across pods - see §6/§7) |
+| Distributed architecture - implemented | ✅ Redis backplane + shared Postgres - **verified live** end-to-end via both `docker compose up --build` and a real Kubernetes deployment (round-robin load balancing across pods, shared storage confirmed via direct DB query, real-time browser delivery across pods - see §6/§7) |
 | Dockerfile, production-optimized | ✅ multi-stage, alpine, non-root, `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true` - built and run live |
 | Kubernetes manifests | ✅ **verified live** on Docker Desktop's built-in cluster - all 11 manifests applied, 5 `finmonitor-api` pods + 2 frontend pods + Postgres + Redis all `1/1 Running`, PVC bound, round-robin + shared storage + real-time delivery all confirmed (see §7) |
 | Horizontal autoscaling | ✅ `k8s/hpa.yaml` - 3-10 replicas, scales on 70% memory utilization. A separate concern from the sync fix: correctness across pods (Redis/Postgres) has to hold first, or autoscaling would just add more pods hammering the same database harder. Applied live but shows `<unknown>` - Docker Desktop's cluster has no metrics-server installed (see §7) |
@@ -368,7 +371,99 @@ solve it, and no amount of extra locking code in this repo would have changed th
 | List virtualization | ❌ deliberately skipped - batching + memoization is sufficient at this scale (see §12), and it fights row-level exit animations |
 | Redis/Postgres high availability | ❌ future work, documented in the ADR |
 
-## 12. Known limitations / future work
+## 12. Hardening pass: async I/O, startup, and correctness
+
+A follow-up pass addressed nine issues found during a deeper review of how this behaves under
+real multi-pod load, not just the happy path. In priority order:
+
+**Critical - required before a real multi-pod run:**
+
+1. **The Postgres repository is now genuinely async.** `PostgresTransactionRepository` previously
+   used synchronous ADO.NET calls (`connection.Open()`, `ExecuteReader()`) inside an otherwise-async
+   request pipeline - each call blocked a thread-pool thread for the full network round trip to
+   Postgres. `ITransactionRepository` is now `Task`-returning end to end
+   (`OpenAsync`/`ExecuteReaderAsync`/`ExecuteNonQueryAsync`/`ReadAsync`, `CancellationToken` threaded
+   through), which matters exactly under the "100 requests arrive quickly" load this project is
+   meant to survive - that's when thread-pool starvation from blocking calls would actually bite.
+2. **Startup no longer blocks on `.GetAwaiter().GetResult()`.** Connecting to Postgres and creating
+   the schema now happens in `StorageStartupHostedService`, not synchronously in `Program.cs`.
+   `/healthz` reflects real readiness (`StartupHealthState`, flipped once storage init succeeds)
+   instead of a hardcoded `"Healthy"`, and `k8s/deployment.yaml` has a `startupProbe` with enough
+   budget (~75s: `periodSeconds: 5 * failureThreshold: 15`) for the connect-retry loop (10 attempts,
+   each capped at a 3s connection timeout plus a 2s backoff, ~50s worst case) to succeed before
+   liveness/readiness even start evaluating - previously a slow/unavailable Postgres at startup
+   could get the pod killed mid-retry. (Checked directly against an unreachable Postgres: whether
+   Kestrel's port opens immediately - serving 503 while retrying - or only once storage succeeds -
+   connection-refused until then - k8s's `httpGet` probe treats both identically as "failed, retry",
+   and either way resolves well inside the 75s budget. So this is a deliberate implementation
+   choice, not something the current probe configuration requires either way of.)
+3. **Distributed mode fails fast instead of silently degrading.** A new `Deployment:Mode=Distributed`
+   switch (set in `k8s/deployment.yaml` and `docker-compose.yml`) makes `Program.cs` refuse to start
+   - a loud `InvalidOperationException`, visible as `CrashLoopBackOff` - unless `Storage:Provider=Postgres`
+   and `Redis:Enabled=true` are both actually set. Without this, a typo'd or missing environment
+   variable could silently leave a "distributed" deployment running on a per-pod in-memory store
+   (each pod's data diverging from the others) or without the SignalR backplane (broadcasts from one
+   pod never reaching clients on another) - both look like they started successfully and both quietly
+   break the exact guarantees §10's ADR is about. The same fail-fast now also covers a misspelled
+   `Storage:Provider` on its own (e.g. `Postgre` instead of `Postgres`), not just the
+   Postgres-required-by-distributed-mode case - see `Options/StorageOptions.cs`.
+
+**Very important - performance and correctness:**
+
+6. **`GET /api/transactions` now uses real keyset (cursor) pagination**, not just a `?limit=` cap on
+   an unbounded table scan. It previously returned the entire table on every call, a cost that only
+   grows over the deployment's lifetime with no corresponding benefit - the frontend only ever keeps
+   its most recent 500 rows anyway (`MAX_TRANSACTIONS`). It now accepts `?limit=` (default 500,
+   capped at 2000) and an opaque `?cursor=` (from the previous page's `nextCursor`) that asks for the
+   next page of strictly older rows, ordered by `(Timestamp DESC, TransactionId DESC)` - the same
+   ordering Postgres's `(timestamp DESC, transaction_id DESC)` index serves, so `WHERE (timestamp,
+   transaction_id) < (@cursorTimestamp, @cursorId) ORDER BY ... LIMIT` stays index-backed instead of
+   sorting the whole table. Keyset instead of `OFFSET`/skip specifically because this table is
+   continuously appended to: an offset-based "page 2" would skip or repeat rows as new transactions
+   land between two page requests, since every row's offset shifts under it - a cursor anchored to
+   the last row's own key doesn't drift like that.
+7. **SignalR broadcast no longer happens inside the POST request.** `TransactionService.CreateAsync`
+   now enqueues onto a bounded `TransactionBroadcastQueue` (a `Channel<Transaction>`) instead of
+   awaiting `ITransactionBroadcaster` directly; `TransactionBroadcastWorker`, a `BackgroundService`,
+   drains it independently. The database write - the durable, authoritative step - now finishes and
+   returns to the client regardless of whether the real-time layer is fast, slow, or briefly down;
+   a broadcast failure is logged and swallowed rather than turning into a 500 for a request that
+   actually already succeeded.
+8. **Missed transactions get caught up on - on reconnect, and without one.** A `seq BIGSERIAL`
+   column gives every stored transaction a monotonic sequence number (both storage providers assign
+   one - `InMemoryTransactionRepository` mirrors it with an `Interlocked`-incremented counter, gaps
+   on rejected duplicates included, matching Postgres's own behavior under `ON CONFLICT DO NOTHING`).
+   `GET /api/transactions/since/{sequence}` (capped at 1,000 rows) lets a client ask "what did I
+   miss" instead of nothing - `useTransactionStream`'s `onreconnected` handler calls it with the
+   highest sequence it's already seen, closing the gap a dropped-and-restored SignalR connection
+   would otherwise leave silently unfilled. That alone isn't enough, though: `TransactionBroadcastQueue`
+   drops the oldest queued item under sustained overload (`DropOldest`), and `TransactionBroadcastWorker`
+   swallows a broadcast failure rather than crash its loop (item 7) - neither of those ever trips a
+   disconnect, so `onreconnected` would never fire for them. Every push already carries its own
+   sequence number, so `useTransactionStream` also checks each live push against the last sequence
+   it saw; a gap schedules the same `/since/{sequence}` catch-up after a short (500ms) debounce -
+   long enough that a merely-reordered cross-pod broadcast can still arrive and close the gap on its
+   own first, without paying for a network round trip for something that was never actually lost.
+   Verified live: with the broadcast queue's capacity temporarily shrunk to 1, firing 150 concurrent
+   POSTs reliably triggers real drops, and the dashboard - connection status never leaving "Live" the
+   entire time - still ends up with all 150, via exactly one `/since/{sequence}` catch-up call.
+9. **Uncaught exceptions get structured, meaningful responses.** `AddProblemDetails()` plus a
+   `StorageExceptionHandler` (`IExceptionHandler`) map a `StorageUnavailableException` to
+   `503 Service Unavailable` instead of a bare `500` - a caller (or a load balancer) can tell
+   "temporarily unreachable, retry" apart from "the request itself is broken." `PostgresTransactionRepository`
+   is the only place that translates a raw `NpgsqlException`/`TimeoutException` into that exception,
+   so the API layer's exception handling never needs to reference Npgsql (or whatever storage
+   technology might replace it later) at all.
+
+**A real bug this surfaced**: adding the `seq` column via `CREATE TABLE IF NOT EXISTS` alone broke
+against the docker-compose Postgres volume from a previous run - the table already existed without
+`seq`, so `CREATE TABLE IF NOT EXISTS` was a no-op and the next `CREATE INDEX ... (seq)` failed with
+`column "seq" does not exist`. Fixed by making the migration additive
+(`ALTER TABLE ... ADD COLUMN IF NOT EXISTS seq BIGINT NOT NULL DEFAULT nextval(...)`) instead of only
+handling a from-scratch database - confirmed by rebuilding and restarting against the exact
+already-broken volume (not a fresh one) and watching it self-heal.
+
+## 13. Known limitations / future work
 
 - The frontend caps its rendered window at the 500 most recent transactions
   (`MAX_TRANSACTIONS` in `useTransactionStream.ts`) to bound DOM size under sustained load.

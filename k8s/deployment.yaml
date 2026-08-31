@@ -35,10 +35,6 @@ spec:
           ports:
             - containerPort: 8080
           env:
-            - name: INSTANCE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
             - name: Storage__Provider
               value: "Postgres"
             - name: Storage__ConnectionString
@@ -47,6 +43,8 @@ spec:
               value: "true"
             - name: Redis__ConnectionString
               value: "finmonitor-redis:6379,abortConnect=false"
+            - name: Deployment__Mode
+              value: "Distributed"
           resources:
             requests:
               cpu: 100m
@@ -54,15 +52,27 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+          # /healthz reflects StorageStartupHostedService's actual readiness (Postgres
+          # connect-retry + schema init in distributed mode), not a hardcoded "Healthy" - so
+          # startupProbe genuinely waits for storage, not just for the process to be alive.
+          # Worst case in the app's own retry loop is ~10 attempts * (3s connect timeout + 2s
+          # backoff) = ~50s; periodSeconds * failureThreshold here budgets ~75s, so a slow
+          # Postgres start doesn't get the pod killed mid-retry. Until startupProbe succeeds
+          # once, readiness/liveness are not evaluated at all (standard k8s behavior), so their
+          # own initialDelaySeconds would be redundant.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 15
           readinessProbe:
             httpGet:
               path: /healthz
               port: 8080
-            initialDelaySeconds: 3
             periodSeconds: 5
           livenessProbe:
             httpGet:
               path: /healthz
               port: 8080
-            initialDelaySeconds: 5
             periodSeconds: 10

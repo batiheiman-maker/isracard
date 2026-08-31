@@ -1,3 +1,4 @@
+using FinMonitor.Domain.DTOs;
 using FinMonitor.Domain.Models;
 using FinMonitor.Domain.Repositories;
 using FluentAssertions;
@@ -24,86 +25,160 @@ public class PostgresTransactionRepositoryTests : IAsyncLifetime
 
     public Task DisposeAsync() => DockerAvailability.IsAvailable ? _container.DisposeAsync().AsTask() : Task.CompletedTask;
 
-    private static Transaction MakeTransaction(Guid? id = null, decimal amount = 100m) => new(
-        id ?? Guid.NewGuid(), amount, "USD", TransactionStatus.Completed, DateTimeOffset.UtcNow);
+    private static Transaction MakeTransaction(Guid? id = null, decimal amount = 100m, DateTimeOffset? timestamp = null) => new(
+        id ?? Guid.NewGuid(), amount, "USD", TransactionStatus.Completed, timestamp ?? DateTimeOffset.UtcNow);
+
+    private async Task<PostgresTransactionRepository> CreateInitializedRepositoryAsync()
+    {
+        var repository = new PostgresTransactionRepository(ConnectionString);
+        await repository.InitializeAsync(CancellationToken.None);
+        return repository;
+    }
 
     [DockerRequiredFact]
-    public async Task TryAdd_NewTransaction_ReturnsTrueAndCanBeRetrievedById()
+    public async Task TryAddAsync_NewTransaction_ReturnsStoredTransactionWithAssignedSequenceAndCanBeRetrievedById()
     {
-        var repo = await PostgresTransactionRepository.CreateAsync(ConnectionString);
+        var repo = await CreateInitializedRepositoryAsync();
         var transaction = MakeTransaction();
 
-        var added = repo.TryAdd(transaction);
+        var stored = await repo.TryAddAsync(transaction);
 
-        added.Should().BeTrue();
-        var retrieved = repo.GetById(transaction.TransactionId);
+        stored.Should().NotBeNull();
+        stored!.Sequence.Should().BeGreaterThan(0);
+        var retrieved = await repo.GetByIdAsync(transaction.TransactionId);
         retrieved.Should().NotBeNull();
         retrieved!.TransactionId.Should().Be(transaction.TransactionId);
         retrieved.Amount.Should().Be(transaction.Amount);
         retrieved.Currency.Should().Be(transaction.Currency);
         retrieved.Status.Should().Be(transaction.Status);
+        retrieved.Sequence.Should().Be(stored.Sequence);
         // Postgres timestamptz is microsecond-precision; .NET DateTimeOffset is tick-precision
         // (100ns) - round-tripping loses the last digit, so compare with a small tolerance.
         retrieved.Timestamp.Should().BeCloseTo(transaction.Timestamp, TimeSpan.FromMilliseconds(1));
     }
 
     [DockerRequiredFact]
-    public async Task TryAdd_DuplicateTransactionId_ReturnsFalseAndDoesNotOverwrite()
+    public async Task TryAddAsync_DuplicateTransactionId_ReturnsNullAndDoesNotOverwrite()
     {
-        var repo = await PostgresTransactionRepository.CreateAsync(ConnectionString);
+        var repo = await CreateInitializedRepositoryAsync();
         var id = Guid.NewGuid();
 
-        repo.TryAdd(MakeTransaction(id, amount: 100m));
-        var addedDuplicate = repo.TryAdd(MakeTransaction(id, amount: 999m));
+        await repo.TryAddAsync(MakeTransaction(id, amount: 100m));
+        var addedDuplicate = await repo.TryAddAsync(MakeTransaction(id, amount: 999m));
 
-        addedDuplicate.Should().BeFalse();
-        repo.GetById(id)!.Amount.Should().Be(100m);
+        addedDuplicate.Should().BeNull();
+        (await repo.GetByIdAsync(id))!.Amount.Should().Be(100m);
     }
 
     [DockerRequiredFact]
-    public async Task GetById_UnknownId_ReturnsNull()
+    public async Task GetByIdAsync_UnknownId_ReturnsNull()
     {
-        var repo = await PostgresTransactionRepository.CreateAsync(ConnectionString);
+        var repo = await CreateInitializedRepositoryAsync();
 
-        repo.GetById(Guid.NewGuid()).Should().BeNull();
+        (await repo.GetByIdAsync(Guid.NewGuid())).Should().BeNull();
+    }
+
+    [DockerRequiredFact]
+    public async Task GetRecentAsync_WithLimitLowerThanStoredCount_ReturnsOnlyLimitRowsAndANextCursor()
+    {
+        var repo = await CreateInitializedRepositoryAsync();
+        for (var i = 0; i < 5; i++)
+        {
+            await repo.TryAddAsync(MakeTransaction());
+        }
+
+        var page = await repo.GetRecentAsync(3, cursor: null);
+
+        page.Items.Should().HaveCount(3);
+        page.NextCursor.Should().NotBeNull();
+    }
+
+    [DockerRequiredFact]
+    public async Task GetRecentAsync_PagingThroughWithCursor_CoversEveryRowExactlyOnceInDescendingOrder()
+    {
+        // Exercises the real "WHERE (timestamp, transaction_id) < (@cursorTimestamp, @cursorId)"
+        // row-value comparison against actual Postgres, not just the equivalent LINQ used by
+        // the in-memory repository - row-value comparison syntax is easy to get subtly wrong
+        // (e.g. operator precedence, type coercion) and only a real server catches that.
+        var repo = await CreateInitializedRepositoryAsync();
+        var now = DateTimeOffset.UtcNow;
+        var expectedIds = new List<Guid>();
+        for (var i = 0; i < 9; i++)
+        {
+            var stored = await repo.TryAddAsync(MakeTransaction(timestamp: now.AddSeconds(-i)));
+            expectedIds.Add(stored!.TransactionId);
+        }
+
+        var collected = new List<Guid>();
+        TransactionCursor? cursor = null;
+        do
+        {
+            var page = await repo.GetRecentAsync(4, cursor);
+            collected.AddRange(page.Items.Select(t => t.TransactionId));
+            cursor = TransactionCursor.TryParse(page.NextCursor, out var next) ? next : null;
+        } while (cursor is not null);
+
+        collected.Should().Equal(expectedIds);
+    }
+
+    [DockerRequiredFact]
+    public async Task GetSinceAsync_ReturnsOnlyTransactionsAfterGivenSequenceInAscendingOrder()
+    {
+        var repo = await CreateInitializedRepositoryAsync();
+        var first = await repo.TryAddAsync(MakeTransaction());
+        var second = await repo.TryAddAsync(MakeTransaction());
+        var third = await repo.TryAddAsync(MakeTransaction());
+
+        var since = await repo.GetSinceAsync(first!.Sequence);
+
+        since.Should().HaveCount(2);
+        since.Should().BeInAscendingOrder(t => t.Sequence);
+        since.Select(t => t.TransactionId).Should().ContainInOrder(second!.TransactionId, third!.TransactionId);
     }
 
     [DockerRequiredFact]
     public async Task DataWrittenByOneInstance_IsVisibleToAnotherInstanceOnSameDatabase_SimulatingSharedDbAcrossPods()
     {
-        var podA = await PostgresTransactionRepository.CreateAsync(ConnectionString);
-        var podB = await PostgresTransactionRepository.CreateAsync(ConnectionString);
+        var podA = await CreateInitializedRepositoryAsync();
+        var podB = new PostgresTransactionRepository(ConnectionString);
         var transaction = MakeTransaction();
 
-        podA.TryAdd(transaction);
+        await podA.TryAddAsync(transaction);
 
-        var retrieved = podB.GetById(transaction.TransactionId);
+        var retrieved = await podB.GetByIdAsync(transaction.TransactionId);
         retrieved.Should().NotBeNull();
         retrieved!.TransactionId.Should().Be(transaction.TransactionId);
-        podB.GetAll().Should().ContainSingle();
+        (await podB.GetRecentAsync(500, cursor: null)).Items.Should().ContainSingle();
     }
 
     [DockerRequiredFact]
-    public async Task TryAdd_With200ConcurrentUniqueTransactionsAcrossMultipleInstances_AllStoredWithNoLostUpdates()
+    public async Task TryAddAsync_With200ConcurrentUniqueTransactionsAcrossMultipleInstances_AllStoredWithNoLostUpdates()
     {
         var ids = Enumerable.Range(0, 200).Select(_ => Guid.NewGuid()).ToList();
-        var repos = await Task.WhenAll(ids.Select(_ => PostgresTransactionRepository.CreateAsync(ConnectionString)));
+        var initialized = await CreateInitializedRepositoryAsync();
+        var repos = ids.Select(_ => new PostgresTransactionRepository(ConnectionString)).ToList();
+        repos[0] = initialized;
 
-        await Task.WhenAll(ids.Select((id, i) => Task.Run(() => repos[i].TryAdd(MakeTransaction(id)))));
+        await Task.WhenAll(ids.Select((id, i) => Task.Run(() => repos[i].TryAddAsync(MakeTransaction(id)))));
 
-        var verifier = await PostgresTransactionRepository.CreateAsync(ConnectionString);
-        verifier.GetAll().Should().HaveCount(200);
-        ids.Should().OnlyContain(id => verifier.GetById(id) != null);
+        var verifier = repos[0];
+        (await verifier.GetRecentAsync(500, cursor: null)).Items.Should().HaveCount(200);
+        foreach (var id in ids)
+        {
+            (await verifier.GetByIdAsync(id)).Should().NotBeNull();
+        }
     }
 
     [DockerRequiredFact]
-    public async Task TryAdd_With50ConcurrentDuplicateTransactionIds_OnlyOneSucceeds()
+    public async Task TryAddAsync_With50ConcurrentDuplicateTransactionIds_OnlyOneSucceeds()
     {
         var id = Guid.NewGuid();
-        var repos = await Task.WhenAll(Enumerable.Range(0, 50).Select(_ => PostgresTransactionRepository.CreateAsync(ConnectionString)));
+        var initialized = await CreateInitializedRepositoryAsync();
+        var repos = Enumerable.Range(0, 50).Select(_ => new PostgresTransactionRepository(ConnectionString)).ToList();
+        repos[0] = initialized;
 
-        var results = await Task.WhenAll(repos.Select(r => Task.Run(() => r.TryAdd(MakeTransaction(id)))));
+        var results = await Task.WhenAll(repos.Select(r => Task.Run(() => r.TryAddAsync(MakeTransaction(id)))));
 
-        results.Count(succeeded => succeeded).Should().Be(1);
+        results.Count(stored => stored is not null).Should().Be(1);
     }
 }

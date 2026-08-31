@@ -1,12 +1,22 @@
+using FinMonitor.Domain.DTOs;
 using FinMonitor.Domain.Models;
 
 namespace FinMonitor.Domain.Repositories;
 
 public interface ITransactionRepository
 {
-    bool TryAdd(Transaction transaction);
+    // Returns the stored transaction (with its assigned Sequence) on success, or null if
+    // transactionId already exists - callers use the null-ness to distinguish success/conflict
+    // without a separate lookup, and get the storage-assigned Sequence back in one round trip.
+    Task<Transaction?> TryAddAsync(Transaction transaction, CancellationToken cancellationToken = default);
 
-    Transaction? GetById(Guid transactionId);
+    Task<Transaction?> GetByIdAsync(Guid transactionId, CancellationToken cancellationToken = default);
 
-    IReadOnlyList<Transaction> GetAll();
+    // Keyset pagination ordered by (Timestamp DESC, TransactionId DESC): with cursor = null,
+    // returns the first `limit` most recent rows; with a cursor (from a previous page's
+    // NextCursor), returns the next `limit` rows strictly older than that cursor. See
+    // TransactionCursor for why keyset beats offset/skip for a continuously-appended table.
+    Task<PagedResult<Transaction>> GetRecentAsync(int limit, TransactionCursor? cursor, CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<Transaction>> GetSinceAsync(long sinceSequence, CancellationToken cancellationToken = default);
 }

@@ -17,85 +17,98 @@ public class TransactionValidatorTests
         new(Guid.NewGuid(), amount, currency, status, timestamp);
 
     [Fact]
-    public void Validate_WithPositiveAmountAndValidCurrencyAndStatus_ReturnsValid()
+    public void ValidateAndNormalize_WithPositiveAmountAndValidCurrencyAndStatus_ReturnsValidWithTransaction()
     {
-        var result = Validator.Validate(ValidRequest());
+        var result = Validator.ValidateAndNormalize(ValidRequest());
 
         result.IsValid.Should().BeTrue();
         result.Errors.Should().BeEmpty();
+        result.Transaction.Should().NotBeNull();
     }
 
     [Fact]
-    public void Validate_WithZeroAmount_ReturnsInvalidWithAmountError()
+    public void ValidateAndNormalize_WithZeroAmount_ReturnsInvalidWithAmountErrorAndNoTransaction()
     {
-        var result = Validator.Validate(ValidRequest(amount: 0));
+        var result = Validator.ValidateAndNormalize(ValidRequest(amount: 0));
+
+        result.IsValid.Should().BeFalse();
+        result.Errors.Should().Contain(e => e.Contains("Amount"));
+        result.Transaction.Should().BeNull();
+    }
+
+    [Fact]
+    public void ValidateAndNormalize_WithNegativeAmount_ReturnsInvalidWithAmountError()
+    {
+        var result = Validator.ValidateAndNormalize(ValidRequest(amount: -5));
 
         result.IsValid.Should().BeFalse();
         result.Errors.Should().Contain(e => e.Contains("Amount"));
     }
 
     [Fact]
-    public void Validate_WithNegativeAmount_ReturnsInvalidWithAmountError()
+    public void ValidateAndNormalize_WithEmptyCurrency_ReturnsInvalidWithCurrencyError()
     {
-        var result = Validator.Validate(ValidRequest(amount: -5));
-
-        result.IsValid.Should().BeFalse();
-        result.Errors.Should().Contain(e => e.Contains("Amount"));
-    }
-
-    [Fact]
-    public void Validate_WithEmptyCurrency_ReturnsInvalidWithCurrencyError()
-    {
-        var result = Validator.Validate(ValidRequest(currency: ""));
+        var result = Validator.ValidateAndNormalize(ValidRequest(currency: ""));
 
         result.IsValid.Should().BeFalse();
         result.Errors.Should().Contain(e => e.Contains("Currency"));
     }
 
     [Fact]
-    public void Validate_WithNonThreeLetterCurrency_ReturnsInvalidWithCurrencyError()
+    public void ValidateAndNormalize_WithNullCurrency_ReturnsInvalidWithCurrencyErrorAndDoesNotThrow()
     {
-        var result = Validator.Validate(ValidRequest(currency: "US"));
+        // CreateTransactionRequest.Currency is non-nullable only by its C# type annotation -
+        // System.Text.Json does not enforce non-nullable reference types on deserialization, so
+        // a client sending `"currency": null` produces a request with a genuinely null Currency
+        // at runtime. The `!` here simulates exactly that (bypassing the compile-time check the
+        // real HTTP pipeline can't rely on either). Before merging Validate+Normalize, this threw
+        // a NullReferenceException instead of returning a validation error.
+        var request = ValidRequest(currency: null!);
+
+        var act = () => Validator.ValidateAndNormalize(request);
+
+        act.Should().NotThrow();
+        var result = act();
+        result.IsValid.Should().BeFalse();
+        result.Errors.Should().Contain(e => e.Contains("Currency"));
+        result.Transaction.Should().BeNull();
+    }
+
+    [Fact]
+    public void ValidateAndNormalize_WithNonThreeLetterCurrency_ReturnsInvalidWithCurrencyError()
+    {
+        var result = Validator.ValidateAndNormalize(ValidRequest(currency: "US"));
 
         result.IsValid.Should().BeFalse();
         result.Errors.Should().Contain(e => e.Contains("Currency"));
     }
 
     [Fact]
-    public void Validate_WithLowercaseCurrency_IsValidAndWillBeNormalizedUppercase()
+    public void ValidateAndNormalize_WithLowercaseCurrency_IsValidAndNormalizedToUppercase()
     {
-        var result = Validator.Validate(ValidRequest(currency: "usd"));
+        var result = Validator.ValidateAndNormalize(ValidRequest(currency: "usd"));
 
         result.IsValid.Should().BeTrue();
+        result.Transaction!.Currency.Should().Be("USD");
     }
 
     [Fact]
-    public void Normalize_WithLowercaseCurrency_ReturnsUppercaseCurrency()
-    {
-        var request = ValidRequest(currency: "usd");
-
-        var normalized = Validator.Normalize(request);
-
-        normalized.Currency.Should().Be("USD");
-    }
-
-    [Fact]
-    public void Normalize_WithMissingTimestamp_DefaultsToUtcNow()
+    public void ValidateAndNormalize_WithMissingTimestamp_DefaultsToUtcNow()
     {
         var request = ValidRequest(timestamp: null);
         var before = DateTimeOffset.UtcNow;
 
-        var normalized = Validator.Normalize(request);
+        var result = Validator.ValidateAndNormalize(request);
 
-        normalized.Timestamp.Should().BeOnOrAfter(before).And.BeOnOrBefore(DateTimeOffset.UtcNow);
+        result.Transaction!.Timestamp.Should().BeOnOrAfter(before).And.BeOnOrBefore(DateTimeOffset.UtcNow);
     }
 
     [Fact]
-    public void Validate_WithEmptyTransactionId_ReturnsInvalidWithTransactionIdError()
+    public void ValidateAndNormalize_WithEmptyTransactionId_ReturnsInvalidWithTransactionIdError()
     {
         var request = new CreateTransactionRequest(Guid.Empty, 10, "USD", TransactionStatus.Pending, null);
 
-        var result = Validator.Validate(request);
+        var result = Validator.ValidateAndNormalize(request);
 
         result.IsValid.Should().BeFalse();
         result.Errors.Should().Contain(e => e.Contains("transactionId"));

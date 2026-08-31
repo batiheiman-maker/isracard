@@ -23,11 +23,11 @@ services:
       context: ./backend/src
       dockerfile: FinMonitor.Api/Dockerfile
     environment: &api-env
-      INSTANCE_NAME: api1
       Storage__Provider: Postgres
       Storage__ConnectionString: "Host=postgres;Port=5432;Database=finmonitor;Username=finmonitor;Password=finmonitor"
       Redis__Enabled: "true"
       Redis__ConnectionString: "redis:6379,abortConnect=false"
+      Deployment__Mode: "Distributed"
     depends_on:
       redis:
         condition: service_started
@@ -38,9 +38,7 @@ services:
     build:
       context: ./backend/src
       dockerfile: FinMonitor.Api/Dockerfile
-    environment:
-      <<: *api-env
-      INSTANCE_NAME: api2
+    environment: *api-env
     depends_on:
       redis:
         condition: service_started
@@ -51,9 +49,7 @@ services:
     build:
       context: ./backend/src
       dockerfile: FinMonitor.Api/Dockerfile
-    environment:
-      <<: *api-env
-      INSTANCE_NAME: api3
+    environment: *api-env
     depends_on:
       redis:
         condition: service_started
