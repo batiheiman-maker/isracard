@@ -6,7 +6,6 @@ export interface Transaction {
   currency: string;
   status: TransactionStatus;
   timestamp: string;
-  sequence: number;
 }
 
 export interface CreateTransactionRequest {

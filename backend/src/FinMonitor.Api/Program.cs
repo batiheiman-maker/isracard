@@ -1,7 +1,6 @@
 using System.Text.Json.Serialization;
 using FinMonitor.Api.Endpoints;
 using FinMonitor.Api.ExceptionHandling;
-using FinMonitor.Api.Health;
 using FinMonitor.Api.HostedServices;
 using FinMonitor.Api.Hubs;
 using FinMonitor.Api.Options;
@@ -9,6 +8,8 @@ using FinMonitor.Api.Realtime;
 using FinMonitor.Domain.Realtime;
 using FinMonitor.Domain.Repositories;
 using FinMonitor.Domain.Services;
+using Microsoft.EntityFrameworkCore;
+using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -29,10 +30,10 @@ var deploymentOptions = builder.Configuration.GetSection(DeploymentOptions.Secti
 var corsOptions = builder.Configuration.GetSection(CorsOptions.SectionName).Get<CorsOptions>() ?? new CorsOptions();
 
 
-if (!storageOptions.IsPostgres && !storageOptions.IsInMemory)
+if (!storageOptions.IsPostgresEf && !storageOptions.IsInMemory)
 {
     throw new InvalidOperationException(
-        $"Storage:Provider must be 'InMemory' or 'Postgres', but was '{storageOptions.Provider}'.");
+        $"Storage:Provider must be 'InMemory' or 'PostgresEf', but was '{storageOptions.Provider}'.");
 }
 
 // Also registered for DI (IOptions<T>) so a future component that needs one of these can take
@@ -55,10 +56,10 @@ builder.Services.AddCors(options =>
 // misconfiguration fails loudly at startup instead of running degraded and inconsistent.
 if (deploymentOptions.IsDistributed)
 {
-    if (!storageOptions.IsPostgres)
+    if (!storageOptions.IsPostgresEf)
     {
         throw new InvalidOperationException(
-            "Deployment:Mode=Distributed requires Storage:Provider=Postgres. Refusing to start " +
+            "Deployment:Mode=Distributed requires Storage:Provider=PostgresEf. Refusing to start " +
             "with a per-pod in-memory store, which would silently diverge across replicas instead " +
             "of failing loudly.");
     }
@@ -72,24 +73,37 @@ if (deploymentOptions.IsDistributed)
     }
 }
 
-// In-memory per pod by default; Postgres in distributed mode so GET is consistent across pods -
-// see PostgresTransactionRepository / the ADR in README.md for why Postgres over SQLite.
-if (storageOptions.IsPostgres)
+string? postgresConnectionString = null;
+if (storageOptions.IsPostgresEf)
 {
-    var connectionString = storageOptions.ConnectionString
-        ?? throw new InvalidOperationException("Storage:ConnectionString is required when Storage:Provider is Postgres.");
-    builder.Services.AddSingleton<ITransactionRepository>(new PostgresTransactionRepository(connectionString));
+    postgresConnectionString = storageOptions.ConnectionString
+        ?? throw new InvalidOperationException("Storage:ConnectionString is required when Storage:Provider is PostgresEf.");
+    builder.Services.AddPooledDbContextFactory<FinMonitorDbContext>(options => options.UseNpgsql(postgresConnectionString));
+}
+
+if (redisOptions.Enabled)
+{
+    builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
+        ConnectionMultiplexer.Connect(redisOptions.ConnectionString));
+
+    builder.Services.AddKeyedSingleton<ITransactionRepository, RedisRecentTransactionsCache>("cache");
+}
+
+if(storageOptions.IsPostgresEf)
+{ 
+    builder.Services.AddKeyedSingleton<ITransactionRepository, EfTransactionRepository>("db");
 }
 else
 {
-    builder.Services.AddSingleton<ITransactionRepository, InMemoryTransactionRepository>();
+    builder.Services.AddKeyedSingleton<ITransactionRepository, InMemoryTransactionRepository>("db");
 }
+
+builder.Services.AddSingleton<ITransactionRepository>(sp =>
+    sp.GetRequiredKeyedService<ITransactionRepository>(redisOptions.Enabled ? "cache" : "db"));
 
 builder.Services.AddHostedService<StorageStartupHostedService>();
 
-builder.Services.AddSingleton<TransactionBroadcastQueue>();
 builder.Services.AddSingleton<ITransactionBroadcaster, SignalRTransactionBroadcaster>();
-builder.Services.AddHostedService<TransactionBroadcastWorker>();
 builder.Services.AddSingleton<ITransactionService, TransactionService>();
 
 // AddJsonProtocol configures the hub's own wire format - ConfigureHttpJsonOptions above only
@@ -102,7 +116,7 @@ if (redisOptions.Enabled)
 {
     signalR.AddStackExchangeRedis(redisOptions.ConnectionString, options =>
     {
-        options.Configuration.ChannelPrefix = StackExchange.Redis.RedisChannel.Literal("finmonitor:");
+        options.Configuration.ChannelPrefix = RedisChannel.Literal("finmonitor:");
     });
 }
 
@@ -129,4 +143,6 @@ app.MapGet("/healthz", () =>
     .WithName("HealthCheck");
 
 app.Run();
+
+public partial class Program { }
 

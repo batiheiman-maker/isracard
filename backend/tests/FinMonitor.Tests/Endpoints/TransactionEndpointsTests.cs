@@ -42,7 +42,6 @@ public class TransactionEndpointsTests : IClassFixture<WebApplicationFactory<Pro
         response.StatusCode.Should().Be(HttpStatusCode.Created);
         var created = await response.Content.ReadFromJsonAsync<Transaction>(JsonOptions);
         created!.TransactionId.Should().Be(request.TransactionId);
-        created.Sequence.Should().BeGreaterThan(0);
     }
 
     [Fact]
@@ -132,23 +131,6 @@ public class TransactionEndpointsTests : IClassFixture<WebApplicationFactory<Pro
     }
 
     [Fact]
-    public async Task GetTransactionsSince_ReturnsOnlyTransactionsPostedAfterGivenSequence()
-    {
-        var client = _factory.CreateClient();
-        var firstResponse = await client.PostAsJsonAsync("/api/transactions", ValidRequest());
-        var first = await firstResponse.Content.ReadFromJsonAsync<Transaction>(JsonOptions);
-        var secondRequest = ValidRequest();
-        await client.PostAsJsonAsync("/api/transactions", secondRequest);
-
-        var sinceResponse = await client.GetAsync($"/api/transactions/since/{first!.Sequence}");
-        var since = await sinceResponse.Content.ReadFromJsonAsync<List<Transaction>>(JsonOptions);
-
-        sinceResponse.StatusCode.Should().Be(HttpStatusCode.OK);
-        since.Should().Contain(t => t.TransactionId == secondRequest.TransactionId);
-        since.Should().NotContain(t => t.TransactionId == first.TransactionId);
-    }
-
-    [Fact]
     public async Task PostTransactions_50ConcurrentRequests_AllSucceedAndAppearInGetAll()
     {
         var client = _factory.CreateClient();
@@ -178,7 +160,7 @@ public class TransactionEndpointsTests : IClassFixture<WebApplicationFactory<Pro
     {
         // Proves the StorageExceptionHandler wiring end-to-end: a repository failure surfaces
         // as StorageUnavailableException (the only type it knows about, translated from Npgsql
-        // specifics at the real repository's boundary - see PostgresTransactionRepository) and
+        // specifics at the real repository's boundary - see EfTransactionRepository) and
         // gets mapped to 503, not the generic 500 AddProblemDetails would otherwise produce.
         var client = _factory.WithWebHostBuilder(builder =>
         {
@@ -202,6 +184,5 @@ public class TransactionEndpointsTests : IClassFixture<WebApplicationFactory<Pro
         public Task<Transaction?> TryAddAsync(Transaction transaction, CancellationToken cancellationToken = default) => throw Fail();
         public Task<Transaction?> GetByIdAsync(Guid transactionId, CancellationToken cancellationToken = default) => throw Fail();
         public Task<PagedResult<Transaction>> GetRecentAsync(int limit, TransactionCursor? cursor, CancellationToken cancellationToken = default) => throw Fail();
-        public Task<IReadOnlyList<Transaction>> GetSinceAsync(long sinceSequence, CancellationToken cancellationToken = default) => throw Fail();
     }
 }

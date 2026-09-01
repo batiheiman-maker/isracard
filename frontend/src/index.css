@@ -265,3 +265,9 @@ button:disabled {
   text-align: center;
   padding: 2rem;
 }
+
+.load-more {
+  display: flex;
+  justify-content: center;
+  margin: 1.25rem 0;
+}

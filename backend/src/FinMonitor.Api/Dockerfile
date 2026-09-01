@@ -1,20 +1,30 @@
-# Build context: backend/src
-FROM mcr.microsoft.com/dotnet/sdk:8.0-alpine AS build
-WORKDIR /src
+# See https://aka.ms/customizecontainer to learn how to customize your debug container and how Visual Studio uses this Dockerfile to build your images for faster debugging.
 
-COPY FinMonitor.Api/FinMonitor.Api.csproj FinMonitor.Api/
-RUN dotnet restore FinMonitor.Api/FinMonitor.Api.csproj
-
-COPY FinMonitor.Api/ FinMonitor.Api/
-RUN dotnet publish FinMonitor.Api/FinMonitor.Api.csproj -c Release -o /app --no-restore
-
-FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine AS final
+# This stage is used when running from VS in fast mode (Default for Debug configuration)
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS base
+USER $APP_UID
 WORKDIR /app
-RUN apk add --no-cache su-exec && addgroup -S appgroup && adduser -S appuser -G appgroup
-ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true
-ENV ASPNETCORE_URLS=http://+:8080
-COPY --from=build /app .
-COPY FinMonitor.Api/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 EXPOSE 8080
-ENTRYPOINT ["docker-entrypoint.sh"]
+EXPOSE 8081
+
+
+# This stage is used to build the service project
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+ARG BUILD_CONFIGURATION=Release
+WORKDIR /src
+COPY ["backend/src/FinMonitor.Api/FinMonitor.Api.csproj", "backend/src/FinMonitor.Api/"]
+RUN dotnet restore "./backend/src/FinMonitor.Api/FinMonitor.Api.csproj"
+COPY . .
+WORKDIR "/src/backend/src/FinMonitor.Api"
+RUN dotnet build "./FinMonitor.Api.csproj" -c $BUILD_CONFIGURATION -o /app/build
+
+# This stage is used to publish the service project to be copied to the final stage
+FROM build AS publish
+ARG BUILD_CONFIGURATION=Release
+RUN dotnet publish "./FinMonitor.Api.csproj" -c $BUILD_CONFIGURATION -o /app/publish /p:UseAppHost=false
+
+# This stage is used in production or when running from VS in regular mode (Default when not using the Debug configuration)
+FROM base AS final
+WORKDIR /app
+COPY --from=publish /app/publish .
+ENTRYPOINT ["dotnet", "FinMonitor.Api.dll"]

@@ -16,8 +16,7 @@ public sealed class SignalRTransactionBroadcaster : ITransactionBroadcaster
 
     // cancellationToken isn't forwarded to the send itself: ITransactionClient's methods describe
     // what a client receives, not a place to smuggle in a cancellation signal for the server-side
-    // send operation - those are different concerns. TransactionBroadcastWorker's own stoppingToken
-    // still governs whether a broadcast is attempted at all (see its ExecuteAsync loop).
+    // send operation - those are different concerns.
     public Task BroadcastAsync(Transaction transaction, CancellationToken cancellationToken = default) =>
         _hubContext.Clients.All.TransactionReceived(transaction);
 }

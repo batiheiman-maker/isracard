@@ -1,13 +1,8 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  useTransactionStream,
-  MAX_CATCH_UP_ITERATIONS,
-  MAX_CATCH_UP_RESUME_CYCLES,
-  CATCH_UP_RESUME_DELAY_MS,
-} from "./useTransactionStream";
+import { useTransactionStream } from "./useTransactionStream";
 import { createHubConnection, TRANSACTION_RECEIVED_EVENT } from "../api/signalrClient";
-import { getTransactions, getTransactionsSince } from "../api/transactionsApi";
+import { getTransactions } from "../api/transactionsApi";
 import type { Transaction } from "../types/transaction";
 
 vi.mock("../api/signalrClient");
@@ -21,6 +16,8 @@ vi.mock("../api/transactionsApi");
 // plain expect() is both correct and sufficient.
 
 const FLUSH_INTERVAL_MS = 120; // mirrors the hook's own private constant
+const RESYNC_INTERVAL_MS = 30_000; // mirrors the hook's own private constant
+const MAX_TRANSACTIONS = 1000; // mirrors the hook's own private constant
 
 function makeTransaction(overrides: Partial<Transaction>): Transaction {
   return {
@@ -29,7 +26,6 @@ function makeTransaction(overrides: Partial<Transaction>): Transaction {
     currency: "USD",
     status: "Completed",
     timestamp: "2026-08-31T00:00:00.000Z",
-    sequence: 1,
     ...overrides,
   };
 }
@@ -73,349 +69,315 @@ describe("useTransactionStream", () => {
     vi.resetAllMocks();
   });
 
-  describe("ordering (Finding A)", () => {
-    it("does not let an older catch-up batch appear above a newer live transaction", async () => {
-      const { connection, handlers } = createMockConnection();
-      vi.mocked(createHubConnection).mockReturnValue(connection as any);
+  it("loads the initial snapshot on mount and reports connected", async () => {
+    const { connection } = createMockConnection();
+    vi.mocked(createHubConnection).mockReturnValue(connection as any);
+    const snapshotTxn = makeTransaction({ transactionId: "t1" });
+    vi.mocked(getTransactions).mockResolvedValue({ items: [snapshotTxn], nextCursor: null });
 
-      const snapshotTxn = makeTransaction({ transactionId: "t1", sequence: 1 });
-      const liveTxn = makeTransaction({ transactionId: "t3", sequence: 3, amount: 30 });
-      const missedTxn = makeTransaction({ transactionId: "t2", sequence: 2, amount: 20 });
-
-      vi.mocked(getTransactions).mockResolvedValue({ items: [snapshotTxn], nextCursor: null });
-      vi.mocked(getTransactionsSince).mockResolvedValue([missedTxn]);
-
-      const { result } = renderHook(() => useTransactionStream());
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      expect(result.current.status).toBe("connected");
-      expect(result.current.transactions).toEqual([snapshotTxn]);
-
-      act(() => {
-        handlers[TRANSACTION_RECEIVED_EVENT](liveTxn);
-      });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(FLUSH_INTERVAL_MS + 30);
-      });
-      expect(result.current.transactions.map((t) => t.transactionId)).toEqual(["t3", "t1"]);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(600); // gap-check debounce
-      });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(FLUSH_INTERVAL_MS + 30);
-      });
-
-      expect(getTransactionsSince).toHaveBeenCalledWith(1);
-      // The older catch-up item (t2, sequence 2) must land BELOW the newer live item (t3), not
-      // prepended above it - this is the exact bug scenario from Finding A.
-      expect(result.current.transactions.map((t) => t.transactionId)).toEqual(["t3", "t2", "t1"]);
+    const { result } = renderHook(() => useTransactionStream());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
     });
+
+    expect(result.current.status).toBe("connected");
+    expect(result.current.transactions).toEqual([snapshotTxn]);
+    expect(connection.start).toHaveBeenCalledTimes(1);
   });
 
-  describe("single-flight + bounded resumption (Finding B)", () => {
-    it("resumes with a second pass after a pass hits MAX_CATCH_UP_ITERATIONS", async () => {
-      const { connection, handlers } = createMockConnection();
-      vi.mocked(createHubConnection).mockReturnValue(connection as any);
-      vi.mocked(getTransactions).mockResolvedValue({ items: [], nextCursor: null });
+  it("adds a live-pushed transaction and dedupes a repeat of the same id", async () => {
+    const { connection, handlers } = createMockConnection();
+    vi.mocked(createHubConnection).mockReturnValue(connection as any);
+    vi.mocked(getTransactions).mockResolvedValue({ items: [], nextCursor: null });
 
-      let seq = 0;
-      let call = 0;
-      vi.mocked(getTransactionsSince).mockImplementation(async () => {
-        call += 1;
-        if (call <= MAX_CATCH_UP_ITERATIONS) {
-          seq += 1;
-          return [makeTransaction({ transactionId: `t${seq}`, sequence: seq })];
-        }
-        return [];
-      });
-
-      renderHook(() => useTransactionStream());
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
-      });
-
-      await act(async () => {
-        handlers.reconnected();
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      expect(getTransactionsSince).toHaveBeenCalledTimes(MAX_CATCH_UP_ITERATIONS);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(CATCH_UP_RESUME_DELAY_MS);
-      });
-      expect(getTransactionsSince).toHaveBeenCalledTimes(MAX_CATCH_UP_ITERATIONS + 1);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(CATCH_UP_RESUME_DELAY_MS * MAX_CATCH_UP_RESUME_CYCLES);
-      });
-      // No further resumption: pass 2 came back empty, so nothing further should be pending.
-      expect(getTransactionsSince).toHaveBeenCalledTimes(MAX_CATCH_UP_ITERATIONS + 1);
+    const { result } = renderHook(() => useTransactionStream());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
     });
 
-    it("coalesces a trigger arriving mid-chain into at most one more pass, never a parallel chain", async () => {
-      const { connection, handlers } = createMockConnection();
-      vi.mocked(createHubConnection).mockReturnValue(connection as any);
-      vi.mocked(getTransactions).mockResolvedValue({ items: [], nextCursor: null });
-
-      const deferredFirstCall = createDeferred<Transaction[]>();
-      let callCount = 0;
-      vi.mocked(getTransactionsSince).mockImplementation(async () => {
-        callCount += 1;
-        if (callCount === 1) return deferredFirstCall.promise;
-        return [];
-      });
-
-      renderHook(() => useTransactionStream());
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
-      });
-
-      // First trigger: reconnect. Starts the chain and issues call #1, held pending.
-      await act(async () => {
-        handlers.reconnected();
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      expect(getTransactionsSince).toHaveBeenCalledTimes(1);
-
-      // Second trigger arrives while call #1 is still unresolved - must coalesce, not start a
-      // second overlapping chain (i.e. must NOT issue a second call while #1 is still in flight).
-      await act(async () => {
-        handlers.reconnected();
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      expect(getTransactionsSince).toHaveBeenCalledTimes(1);
-
-      // Resolve the held call with an empty batch - pass 1 completes immediately
-      // (moreLikelyPending: false, since runCatchUpPass itself only keeps looping while a batch
-      // comes back non-empty), but the coalesced pending flag should still force exactly one
-      // more pass.
-      await act(async () => {
-        deferredFirstCall.resolve([]);
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(CATCH_UP_RESUME_DELAY_MS);
-      });
-
-      expect(getTransactionsSince).toHaveBeenCalledTimes(2);
-
-      // Confirm no further, unbounded resumption happened beyond the single coalesced pass.
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(CATCH_UP_RESUME_DELAY_MS * MAX_CATCH_UP_RESUME_CYCLES);
-      });
-      expect(getTransactionsSince).toHaveBeenCalledTimes(2);
+    const liveTxn = makeTransaction({ transactionId: "live-1" });
+    act(() => {
+      handlers[TRANSACTION_RECEIVED_EVENT](liveTxn);
+      handlers[TRANSACTION_RECEIVED_EVENT](liveTxn); // duplicate push of the same transaction
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FLUSH_INTERVAL_MS + 30);
     });
 
-    it("reaches the expected final sequence with no duplicates after a multi-pass catch-up", async () => {
-      const { connection, handlers } = createMockConnection();
-      vi.mocked(createHubConnection).mockReturnValue(connection as any);
-      vi.mocked(getTransactions).mockResolvedValue({ items: [], nextCursor: null });
+    expect(result.current.transactions.map((t) => t.transactionId)).toEqual(["live-1"]);
+  });
 
-      // 25 missing items: pass 1 delivers MAX_CATCH_UP_ITERATIONS batches of 1 (hits the cap),
-      // pass 2 delivers the remaining 5 in one batch, then empty.
-      const total = MAX_CATCH_UP_ITERATIONS + 5;
-      let seq = 0;
-      let call = 0;
-      vi.mocked(getTransactionsSince).mockImplementation(async () => {
-        call += 1;
-        if (call <= MAX_CATCH_UP_ITERATIONS) {
-          seq += 1;
-          return [makeTransaction({ transactionId: `t${seq}`, sequence: seq })];
-        }
-        if (call === MAX_CATCH_UP_ITERATIONS + 1) {
-          const batch: Transaction[] = [];
-          while (seq < total) {
-            seq += 1;
-            batch.push(makeTransaction({ transactionId: `t${seq}`, sequence: seq }));
-          }
-          return batch;
-        }
-        return [];
-      });
+  it("orders transactions by timestamp descending, tie-broken by transactionId descending", async () => {
+    const { connection, handlers } = createMockConnection();
+    vi.mocked(createHubConnection).mockReturnValue(connection as any);
+    const older = makeTransaction({ transactionId: "older", timestamp: "2026-08-31T00:00:00.000Z" });
+    vi.mocked(getTransactions).mockResolvedValue({ items: [older], nextCursor: null });
 
-      const { result } = renderHook(() => useTransactionStream());
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
-      });
-
-      await act(async () => {
-        handlers.reconnected();
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(CATCH_UP_RESUME_DELAY_MS);
-      });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(FLUSH_INTERVAL_MS + 30);
-      });
-
-      expect(result.current.transactions).toHaveLength(total);
-
-      const ids = result.current.transactions.map((t) => t.transactionId);
-      expect(new Set(ids).size).toBe(ids.length); // no duplicates
-
-      const sequences = result.current.transactions.map((t) => t.sequence).sort((a, b) => a - b);
-      expect(sequences[0]).toBe(1);
-      expect(sequences[sequences.length - 1]).toBe(total);
+    const { result } = renderHook(() => useTransactionStream());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
     });
 
-    it("falls back to a fresh snapshot and resynchronizes when the resume-cycle ceiling is exhausted", async () => {
-      const { connection, handlers } = createMockConnection();
-      vi.mocked(createHubConnection).mockReturnValue(connection as any);
+    // Two live pushes with the same timestamp as each other, both newer than the snapshot item -
+    // arrival order is intentionally reversed from the expected tie-broken sort order, so this
+    // only passes if the hook actually sorts rather than just prepending in arrival order.
+    const sameInstantA = makeTransaction({
+      transactionId: "aaa",
+      timestamp: "2026-08-31T00:01:00.000Z",
+    });
+    const sameInstantB = makeTransaction({
+      transactionId: "bbb",
+      timestamp: "2026-08-31T00:01:00.000Z",
+    });
+    act(() => {
+      handlers[TRANSACTION_RECEIVED_EVENT](sameInstantA);
+      handlers[TRANSACTION_RECEIVED_EVENT](sameInstantB);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FLUSH_INTERVAL_MS + 30);
+    });
 
-      const fallbackSnapshot = [
-        makeTransaction({ transactionId: "fresh-2", sequence: 200 }),
-        makeTransaction({ transactionId: "fresh-1", sequence: 199 }),
-      ];
-      vi.mocked(getTransactions)
-        .mockResolvedValueOnce({ items: [], nextCursor: null }) // initial mount snapshot
-        .mockResolvedValueOnce({ items: fallbackSnapshot, nextCursor: null }); // fallback resync
+    expect(result.current.transactions.map((t) => t.transactionId)).toEqual(["bbb", "aaa", "older"]);
+  });
 
-      // Every /since call keeps returning a full, non-empty batch - the chain never naturally
-      // catches up, so it must run the entire MAX_CATCH_UP_RESUME_CYCLES * MAX_CATCH_UP_ITERATIONS
-      // budget and then fall back, rather than resuming forever.
-      let seq = 0;
-      vi.mocked(getTransactionsSince).mockImplementation(async () => {
-        seq += 1;
-        return [makeTransaction({ transactionId: `t${seq}`, sequence: seq })];
-      });
+  it("caps rendered transactions at MAX_TRANSACTIONS, dropping the oldest", async () => {
+    const { connection, handlers } = createMockConnection();
+    vi.mocked(createHubConnection).mockReturnValue(connection as any);
+    const base = new Date("2026-08-31T00:00:00.000Z").getTime();
+    // Oldest-first snapshot of exactly MAX_TRANSACTIONS items.
+    const snapshot = Array.from({ length: MAX_TRANSACTIONS }, (_, i) =>
+      makeTransaction({
+        transactionId: `s${i}`,
+        timestamp: new Date(base + i * 1000).toISOString(),
+      }),
+    ).reverse();
+    vi.mocked(getTransactions).mockResolvedValue({ items: snapshot, nextCursor: null });
 
-      const { result } = renderHook(() => useTransactionStream());
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
-      });
+    const { result } = renderHook(() => useTransactionStream());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current.transactions).toHaveLength(MAX_TRANSACTIONS);
 
-      await act(async () => {
-        handlers.reconnected();
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(
-          CATCH_UP_RESUME_DELAY_MS * MAX_CATCH_UP_RESUME_CYCLES + 100,
-        );
-      });
+    const newestLive = makeTransaction({
+      transactionId: "newest",
+      timestamp: new Date(base + MAX_TRANSACTIONS * 1000).toISOString(),
+    });
+    act(() => {
+      handlers[TRANSACTION_RECEIVED_EVENT](newestLive);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FLUSH_INTERVAL_MS + 30);
+    });
 
-      // Ran to full exhaustion (not more, not less), then fell back to a second snapshot fetch.
-      expect(getTransactionsSince).toHaveBeenCalledTimes(
-        MAX_CATCH_UP_RESUME_CYCLES * MAX_CATCH_UP_ITERATIONS,
+    expect(result.current.transactions).toHaveLength(MAX_TRANSACTIONS);
+    expect(result.current.transactions[0].transactionId).toBe("newest");
+    // The single oldest snapshot item (s0, pushed out by the newest live push) is gone.
+    expect(result.current.transactions.map((t) => t.transactionId)).not.toContain("s0");
+  });
+
+  it("re-fetches the recent list on reconnect and merges it in", async () => {
+    const { connection, handlers } = createMockConnection();
+    vi.mocked(createHubConnection).mockReturnValue(connection as any);
+    const initial = makeTransaction({ transactionId: "initial" });
+    const resynced = makeTransaction({ transactionId: "resynced" });
+    vi.mocked(getTransactions)
+      .mockResolvedValueOnce({ items: [initial], nextCursor: null }) // initial mount snapshot
+      .mockResolvedValueOnce({ items: [initial, resynced], nextCursor: null }); // reconnect resync
+
+    const { result } = renderHook(() => useTransactionStream());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    await act(async () => {
+      handlers.reconnected();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FLUSH_INTERVAL_MS + 30);
+    });
+
+    expect(getTransactions).toHaveBeenCalledTimes(2);
+    expect(result.current.status).toBe("connected");
+    expect(result.current.transactions.map((t) => t.transactionId).sort()).toEqual(
+      ["initial", "resynced"].sort(),
+    );
+  });
+
+  it("does not lose a live transaction that arrives while a reconnect resync is in flight", async () => {
+    const { connection, handlers } = createMockConnection();
+    vi.mocked(createHubConnection).mockReturnValue(connection as any);
+
+    const deferredResync = createDeferred<{ items: Transaction[]; nextCursor: string | null }>();
+    vi.mocked(getTransactions)
+      .mockResolvedValueOnce({ items: [], nextCursor: null }) // initial mount snapshot
+      .mockReturnValueOnce(deferredResync.promise); // reconnect resync - held pending
+
+    const { result } = renderHook(() => useTransactionStream());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    await act(async () => {
+      handlers.reconnected();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(getTransactions).toHaveBeenCalledTimes(2);
+
+    // A live transaction arrives WHILE the resync request is still in flight.
+    const liveTxn = makeTransaction({
+      transactionId: "live-during-fetch",
+      timestamp: "2026-08-31T00:05:00.000Z",
+    });
+    act(() => {
+      handlers[TRANSACTION_RECEIVED_EVENT](liveTxn);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FLUSH_INTERVAL_MS + 30);
+    });
+    expect(result.current.transactions.map((t) => t.transactionId)).toContain("live-during-fetch");
+
+    // The resync resolves WITHOUT that transaction - simulating the race where the DB read
+    // behind it happened just before the live write became visible.
+    const resyncedTxn = makeTransaction({
+      transactionId: "resynced",
+      timestamp: "2026-08-31T00:04:00.000Z",
+    });
+    await act(async () => {
+      deferredResync.resolve({ items: [resyncedTxn], nextCursor: null });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FLUSH_INTERVAL_MS + 30);
+    });
+
+    const ids = result.current.transactions.map((t) => t.transactionId);
+    expect(ids).toContain("live-during-fetch");
+    expect(ids).toContain("resynced");
+  });
+
+  it("hasMore reflects the initial snapshot's cursor, and loadMore fetches and appends the next page", async () => {
+    const { connection } = createMockConnection();
+    vi.mocked(createHubConnection).mockReturnValue(connection as any);
+    const initial = makeTransaction({ transactionId: "initial" });
+    const older = makeTransaction({ transactionId: "older" });
+    vi.mocked(getTransactions)
+      .mockResolvedValueOnce({ items: [initial], nextCursor: "cursor-1" }) // initial mount snapshot
+      .mockResolvedValueOnce({ items: [older], nextCursor: null }); // loadMore page
+
+    const { result } = renderHook(() => useTransactionStream());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current.hasMore).toBe(true);
+
+    await act(async () => {
+      await result.current.loadMore();
+    });
+
+    expect(getTransactions).toHaveBeenLastCalledWith("cursor-1");
+    expect(result.current.transactions.map((t) => t.transactionId)).toEqual(["initial", "older"]);
+    expect(result.current.hasMore).toBe(false);
+  });
+
+  it("loadMore is a no-op once there is nothing more to load", async () => {
+    const { connection } = createMockConnection();
+    vi.mocked(createHubConnection).mockReturnValue(connection as any);
+    vi.mocked(getTransactions).mockResolvedValue({ items: [], nextCursor: null });
+
+    const { result } = renderHook(() => useTransactionStream());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current.hasMore).toBe(false);
+
+    await act(async () => {
+      await result.current.loadMore();
+    });
+
+    expect(getTransactions).toHaveBeenCalledTimes(1); // only the initial snapshot call
+  });
+
+  it("loadMore dedupes against transactions already shown", async () => {
+    const { connection } = createMockConnection();
+    vi.mocked(createHubConnection).mockReturnValue(connection as any);
+    const initial = makeTransaction({ transactionId: "initial" });
+    vi.mocked(getTransactions)
+      .mockResolvedValueOnce({ items: [initial], nextCursor: "cursor-1" })
+      .mockResolvedValueOnce({ items: [initial], nextCursor: null }); // overlapping page
+
+    const { result } = renderHook(() => useTransactionStream());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    await act(async () => {
+      await result.current.loadMore();
+    });
+
+    expect(result.current.transactions.map((t) => t.transactionId)).toEqual(["initial"]);
+  });
+
+  it("does not truncate history loaded via loadMore when a later live push triggers a flush", async () => {
+    const { connection, handlers } = createMockConnection();
+    vi.mocked(createHubConnection).mockReturnValue(connection as any);
+    const base = new Date("2026-08-31T00:00:00.000Z").getTime();
+    const snapshot = Array.from({ length: MAX_TRANSACTIONS }, (_, i) =>
+      makeTransaction({ transactionId: `s${i}`, timestamp: new Date(base + i * 1000).toISOString() }),
+    ).reverse();
+    const older = Array.from({ length: 5 }, (_, i) =>
+      makeTransaction({ transactionId: `o${i}`, timestamp: new Date(base - (i + 1) * 1000).toISOString() }),
+    );
+    vi.mocked(getTransactions)
+      .mockResolvedValueOnce({ items: snapshot, nextCursor: "cursor-1" })
+      .mockResolvedValueOnce({ items: older, nextCursor: null });
+
+    const { result } = renderHook(() => useTransactionStream());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    await act(async () => {
+      await result.current.loadMore();
+    });
+    expect(result.current.transactions).toHaveLength(MAX_TRANSACTIONS + 5);
+
+    act(() => {
+      handlers[TRANSACTION_RECEIVED_EVENT](
+        makeTransaction({
+          transactionId: "newest",
+          timestamp: new Date(base + MAX_TRANSACTIONS * 1000).toISOString(),
+        }),
       );
-      expect(getTransactions).toHaveBeenCalledTimes(2);
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(FLUSH_INTERVAL_MS + 30);
-      });
-
-      // The fallback snapshot is merged in, not swapped in place of what's there: the exhausted
-      // chain's own already-delivered partial progress (t1..t100, from its 100 successful /since
-      // calls) is real, durable data - resyncFromSnapshot must not discard it, only fill in what
-      // it couldn't reach. Both the fresh snapshot items and the full partial backlog are present,
-      // deduplicated, and correctly ordered by sequence (highest first).
-      const ids = result.current.transactions.map((t) => t.transactionId);
-      expect(ids).toHaveLength(MAX_CATCH_UP_RESUME_CYCLES * MAX_CATCH_UP_ITERATIONS + 2); // 100 + 2
-      expect(new Set(ids).size).toBe(ids.length); // no duplicates
-      expect(ids[0]).toBe("fresh-2"); // sequence 200 - highest, sorted first
-      expect(ids[1]).toBe("fresh-1"); // sequence 199
-      expect(ids).toContain("t100"); // the exhausted chain's own progress, preserved not discarded
-
-      // lastSequenceRef was reset to the fallback snapshot's own high-water mark (200), not left
-      // at wherever the exhausted chain's own `since` had reached - proven indirectly: a live
-      // push exactly contiguous with that mark must not be treated as a gap.
-      const sinceCallsSoFar = vi.mocked(getTransactionsSince).mock.calls.length;
-      act(() => {
-        handlers[TRANSACTION_RECEIVED_EVENT](
-          makeTransaction({ transactionId: "next", sequence: 201 }),
-        );
-      });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(FLUSH_INTERVAL_MS + 30);
-      });
-      expect(getTransactionsSince).toHaveBeenCalledTimes(sinceCallsSoFar);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FLUSH_INTERVAL_MS + 30);
     });
 
-    it("does not lose a live transaction that arrives while the fallback snapshot request is in flight", async () => {
-      const { connection, handlers } = createMockConnection();
-      vi.mocked(createHubConnection).mockReturnValue(connection as any);
+    expect(result.current.transactions).toHaveLength(MAX_TRANSACTIONS + 6);
+    expect(result.current.transactions.map((t) => t.transactionId)).toContain("o4");
+  });
 
-      // Every /since call keeps returning a full, non-empty batch - forces the chain to exhaust
-      // MAX_CATCH_UP_RESUME_CYCLES and trigger the snapshot fallback.
-      let seq = 0;
-      vi.mocked(getTransactionsSince).mockImplementation(async () => {
-        seq += 1;
-        return [makeTransaction({ transactionId: `t${seq}`, sequence: seq })];
-      });
+  it("periodically re-fetches the recent list while connected as a self-healing safety net", async () => {
+    const { connection } = createMockConnection();
+    vi.mocked(createHubConnection).mockReturnValue(connection as any);
+    vi.mocked(getTransactions).mockResolvedValue({ items: [], nextCursor: null });
 
-      const deferredSnapshot = createDeferred<{ items: Transaction[]; nextCursor: string | null }>();
-      vi.mocked(getTransactions)
-        .mockResolvedValueOnce({ items: [], nextCursor: null }) // initial mount snapshot
-        .mockReturnValueOnce(deferredSnapshot.promise); // fallback resync - held pending
-
-      const { result } = renderHook(() => useTransactionStream());
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
-      });
-
-      await act(async () => {
-        handlers.reconnected();
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(
-          CATCH_UP_RESUME_DELAY_MS * MAX_CATCH_UP_RESUME_CYCLES + 100,
-        );
-      });
-
-      // The fallback snapshot request has started but is being held unresolved.
-      expect(getTransactions).toHaveBeenCalledTimes(2);
-
-      // A newer live transaction arrives WHILE the snapshot request is still in flight.
-      const liveTxn = makeTransaction({ transactionId: "live-during-fetch", sequence: 500 });
-      act(() => {
-        handlers[TRANSACTION_RECEIVED_EVENT](liveTxn);
-      });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(FLUSH_INTERVAL_MS + 30);
-      });
-
-      // Already visible before the snapshot resolves.
-      expect(result.current.transactions.map((t) => t.transactionId)).toContain(
-        "live-during-fetch",
-      );
-
-      // The snapshot resolves WITHOUT that transaction - simulating the race: the DB read behind
-      // this snapshot happened just before the live write became visible.
-      const fallbackSnapshot = [
-        makeTransaction({ transactionId: "fresh-2", sequence: 200 }),
-        makeTransaction({ transactionId: "fresh-1", sequence: 199 }),
-      ];
-      await act(async () => {
-        deferredSnapshot.resolve({ items: fallbackSnapshot, nextCursor: null });
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(FLUSH_INTERVAL_MS + 30);
-      });
-
-      // The live transaction must still be present - the snapshot must not have erased it - and
-      // the snapshot's own items must still have been merged in correctly (gap still recovered).
-      const ids = result.current.transactions.map((t) => t.transactionId);
-      expect(ids).toContain("live-during-fetch");
-      expect(ids).toContain("fresh-2");
-      expect(ids).toContain("fresh-1");
-
-      // lastSequenceRef must not have regressed to the snapshot's lower max (200): a subsequent
-      // live push exactly contiguous with the live transaction's own sequence (500) must not be
-      // treated as a gap.
-      const sinceCallsSoFar = vi.mocked(getTransactionsSince).mock.calls.length;
-      act(() => {
-        handlers[TRANSACTION_RECEIVED_EVENT](
-          makeTransaction({ transactionId: "next", sequence: 501 }),
-        );
-      });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(FLUSH_INTERVAL_MS + 30);
-      });
-      expect(getTransactionsSince).toHaveBeenCalledTimes(sinceCallsSoFar);
+    renderHook(() => useTransactionStream());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
     });
+    expect(getTransactions).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RESYNC_INTERVAL_MS);
+    });
+    expect(getTransactions).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RESYNC_INTERVAL_MS);
+    });
+    expect(getTransactions).toHaveBeenCalledTimes(3);
   });
 });

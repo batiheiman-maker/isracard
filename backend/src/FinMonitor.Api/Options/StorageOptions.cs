@@ -7,6 +7,6 @@ public sealed class StorageOptions
     public string Provider { get; set; } = "InMemory";
     public string? ConnectionString { get; set; }
 
-    public bool IsPostgres => Provider.Equals("Postgres", StringComparison.OrdinalIgnoreCase);
+    public bool IsPostgresEf => Provider.Equals("PostgresEf", StringComparison.OrdinalIgnoreCase);
     public bool IsInMemory => Provider.Equals("InMemory", StringComparison.OrdinalIgnoreCase);
 }

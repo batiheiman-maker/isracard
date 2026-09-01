@@ -36,7 +36,7 @@ spec:
             - containerPort: 8080
           env:
             - name: Storage__Provider
-              value: "Postgres"
+              value: "PostgresEf"
             - name: Storage__ConnectionString
               value: "Host=finmonitor-postgres;Port=5432;Database=finmonitor;Username=finmonitor;Password=finmonitor"
             - name: Redis__Enabled

@@ -2,25 +2,23 @@ using FinMonitor.Domain.DTOs;
 using FinMonitor.Domain.Models;
 using FinMonitor.Domain.Repositories;
 using FluentAssertions;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Testcontainers.PostgreSql;
 
 namespace FinMonitor.Tests.Repositories;
 
 // Runs against a real, disposable Postgres container per test (via Testcontainers) rather than
 // a mock or an in-memory substitute - the whole point is proving concurrent-writer behavior
-// that only a real multi-writer database can demonstrate, which SQLite fundamentally cannot
-// (see the ADR in README.md for why SQLite over a shared volume was replaced by this).
-public class PostgresTransactionRepositoryTests : IAsyncLifetime
+// that only a real multi-writer database can demonstrate, in particular that the
+// DbUpdateException/unique-violation path is as race-safe as an explicit ON CONFLICT DO NOTHING
+// would be under concurrent duplicate inserts.
+public class EfTransactionRepositoryTests : IAsyncLifetime
 {
-    private readonly PostgreSqlContainer _container = new PostgreSqlBuilder()
-        .WithImage("postgres:16-alpine")
-        .Build();
+    private readonly PostgreSqlContainer _container = new PostgreSqlBuilder("postgres:16-alpine").Build();
 
     private string ConnectionString => _container.GetConnectionString();
 
-    // Guarded even though [DockerRequiredFact] already prevents these tests from running at all
-    // without Docker - defense in depth, in case a future xUnit version invokes IAsyncLifetime
-    // before checking Skip.
     public Task InitializeAsync() => DockerAvailability.IsAvailable ? _container.StartAsync() : Task.CompletedTask;
 
     public Task DisposeAsync() => DockerAvailability.IsAvailable ? _container.DisposeAsync().AsTask() : Task.CompletedTask;
@@ -28,15 +26,24 @@ public class PostgresTransactionRepositoryTests : IAsyncLifetime
     private static Transaction MakeTransaction(Guid? id = null, decimal amount = 100m, DateTimeOffset? timestamp = null) => new(
         id ?? Guid.NewGuid(), amount, "USD", TransactionStatus.Completed, timestamp ?? DateTimeOffset.UtcNow);
 
-    private async Task<PostgresTransactionRepository> CreateInitializedRepositoryAsync()
+    private EfTransactionRepository CreateRepository()
     {
-        var repository = new PostgresTransactionRepository(ConnectionString);
+        var options = new DbContextOptionsBuilder<FinMonitorDbContext>()
+            .UseNpgsql(ConnectionString)
+            .Options;
+        var contextFactory = new PooledDbContextFactory<FinMonitorDbContext>(options);
+        return new EfTransactionRepository(contextFactory, ConnectionString);
+    }
+
+    private async Task<EfTransactionRepository> CreateInitializedRepositoryAsync()
+    {
+        var repository = CreateRepository();
         await repository.InitializeAsync(CancellationToken.None);
         return repository;
     }
 
     [DockerRequiredFact]
-    public async Task TryAddAsync_NewTransaction_ReturnsStoredTransactionWithAssignedSequenceAndCanBeRetrievedById()
+    public async Task TryAddAsync_NewTransaction_ReturnsStoredTransactionAndCanBeRetrievedById()
     {
         var repo = await CreateInitializedRepositoryAsync();
         var transaction = MakeTransaction();
@@ -44,14 +51,12 @@ public class PostgresTransactionRepositoryTests : IAsyncLifetime
         var stored = await repo.TryAddAsync(transaction);
 
         stored.Should().NotBeNull();
-        stored!.Sequence.Should().BeGreaterThan(0);
         var retrieved = await repo.GetByIdAsync(transaction.TransactionId);
         retrieved.Should().NotBeNull();
         retrieved!.TransactionId.Should().Be(transaction.TransactionId);
         retrieved.Amount.Should().Be(transaction.Amount);
         retrieved.Currency.Should().Be(transaction.Currency);
         retrieved.Status.Should().Be(transaction.Status);
-        retrieved.Sequence.Should().Be(stored.Sequence);
         // Postgres timestamptz is microsecond-precision; .NET DateTimeOffset is tick-precision
         // (100ns) - round-tripping loses the last digit, so compare with a small tolerance.
         retrieved.Timestamp.Should().BeCloseTo(transaction.Timestamp, TimeSpan.FromMilliseconds(1));
@@ -96,10 +101,9 @@ public class PostgresTransactionRepositoryTests : IAsyncLifetime
     [DockerRequiredFact]
     public async Task GetRecentAsync_PagingThroughWithCursor_CoversEveryRowExactlyOnceInDescendingOrder()
     {
-        // Exercises the real "WHERE (timestamp, transaction_id) < (@cursorTimestamp, @cursorId)"
-        // row-value comparison against actual Postgres, not just the equivalent LINQ used by
-        // the in-memory repository - row-value comparison syntax is easy to get subtly wrong
-        // (e.g. operator precedence, type coercion) and only a real server catches that.
+        // Exercises the real EF/Npgsql-translated cursor predicate against actual Postgres, not
+        // just the equivalent LINQ-to-Objects used by the in-memory repository - if
+        // Guid.CompareTo doesn't translate the way this test assumes, this is what catches it.
         var repo = await CreateInitializedRepositoryAsync();
         var now = DateTimeOffset.UtcNow;
         var expectedIds = new List<Guid>();
@@ -122,25 +126,10 @@ public class PostgresTransactionRepositoryTests : IAsyncLifetime
     }
 
     [DockerRequiredFact]
-    public async Task GetSinceAsync_ReturnsOnlyTransactionsAfterGivenSequenceInAscendingOrder()
-    {
-        var repo = await CreateInitializedRepositoryAsync();
-        var first = await repo.TryAddAsync(MakeTransaction());
-        var second = await repo.TryAddAsync(MakeTransaction());
-        var third = await repo.TryAddAsync(MakeTransaction());
-
-        var since = await repo.GetSinceAsync(first!.Sequence);
-
-        since.Should().HaveCount(2);
-        since.Should().BeInAscendingOrder(t => t.Sequence);
-        since.Select(t => t.TransactionId).Should().ContainInOrder(second!.TransactionId, third!.TransactionId);
-    }
-
-    [DockerRequiredFact]
     public async Task DataWrittenByOneInstance_IsVisibleToAnotherInstanceOnSameDatabase_SimulatingSharedDbAcrossPods()
     {
         var podA = await CreateInitializedRepositoryAsync();
-        var podB = new PostgresTransactionRepository(ConnectionString);
+        var podB = CreateRepository();
         var transaction = MakeTransaction();
 
         await podA.TryAddAsync(transaction);
@@ -156,7 +145,7 @@ public class PostgresTransactionRepositoryTests : IAsyncLifetime
     {
         var ids = Enumerable.Range(0, 200).Select(_ => Guid.NewGuid()).ToList();
         var initialized = await CreateInitializedRepositoryAsync();
-        var repos = ids.Select(_ => new PostgresTransactionRepository(ConnectionString)).ToList();
+        var repos = ids.Select(_ => CreateRepository()).ToList();
         repos[0] = initialized;
 
         await Task.WhenAll(ids.Select((id, i) => Task.Run(() => repos[i].TryAddAsync(MakeTransaction(id)))));
@@ -174,7 +163,7 @@ public class PostgresTransactionRepositoryTests : IAsyncLifetime
     {
         var id = Guid.NewGuid();
         var initialized = await CreateInitializedRepositoryAsync();
-        var repos = Enumerable.Range(0, 50).Select(_ => new PostgresTransactionRepository(ConnectionString)).ToList();
+        var repos = Enumerable.Range(0, 50).Select(_ => CreateRepository()).ToList();
         repos[0] = initialized;
 
         var results = await Task.WhenAll(repos.Select(r => Task.Run(() => r.TryAddAsync(MakeTransaction(id)))));

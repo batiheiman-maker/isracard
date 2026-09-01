@@ -11,7 +11,7 @@ public class InMemoryTransactionRepositoryTests
         id ?? Guid.NewGuid(), amount, "USD", TransactionStatus.Completed, timestamp ?? DateTimeOffset.UtcNow);
 
     [Fact]
-    public async Task TryAddAsync_NewTransaction_ReturnsStoredTransactionWithAssignedSequenceAndCanBeRetrievedById()
+    public async Task TryAddAsync_NewTransaction_ReturnsStoredTransactionAndCanBeRetrievedById()
     {
         var repo = new InMemoryTransactionRepository();
         var transaction = MakeTransaction();
@@ -19,7 +19,6 @@ public class InMemoryTransactionRepositoryTests
         var stored = await repo.TryAddAsync(transaction);
 
         stored.Should().NotBeNull();
-        stored!.Sequence.Should().BeGreaterThan(0);
         (await repo.GetByIdAsync(transaction.TransactionId)).Should().Be(stored);
     }
 
@@ -141,44 +140,5 @@ public class InMemoryTransactionRepositoryTests
         var secondPage = await repo.GetRecentAsync(2, cursor);
 
         secondPage.Items.Select(t => t.TransactionId).Should().Equal(olderIds.Skip(2).Take(2));
-    }
-
-    [Fact]
-    public async Task GetSinceAsync_ReturnsOnlyTransactionsAfterGivenSequenceInAscendingOrder()
-    {
-        var repo = new InMemoryTransactionRepository();
-        var first = await repo.TryAddAsync(MakeTransaction());
-        var second = await repo.TryAddAsync(MakeTransaction());
-        var third = await repo.TryAddAsync(MakeTransaction());
-
-        var since = await repo.GetSinceAsync(first!.Sequence);
-
-        since.Should().HaveCount(2);
-        since.Should().BeInAscendingOrder(t => t.Sequence);
-        since.Select(t => t.TransactionId).Should().ContainInOrder(second!.TransactionId, third!.TransactionId);
-    }
-
-    [Fact]
-    public async Task GetSinceAsync_WithNoNewerTransactions_ReturnsEmpty()
-    {
-        var repo = new InMemoryTransactionRepository();
-        var stored = await repo.TryAddAsync(MakeTransaction());
-
-        (await repo.GetSinceAsync(stored!.Sequence)).Should().BeEmpty();
-    }
-
-    [Fact]
-    public async Task GetSinceAsync_WithMoreThanMaxCatchUpBatchNewerTransactions_ReturnsOnlyTheOldestBatch()
-    {
-        var repo = new InMemoryTransactionRepository();
-        for (var i = 0; i < 1_200; i++)
-        {
-            await repo.TryAddAsync(MakeTransaction());
-        }
-
-        var since = await repo.GetSinceAsync(0);
-
-        since.Should().HaveCount(1_000);
-        since.Should().BeInAscendingOrder(t => t.Sequence);
     }
 }

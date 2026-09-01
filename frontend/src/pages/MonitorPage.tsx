@@ -11,7 +11,7 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 export function MonitorPage() {
-  const { transactions, status } = useTransactionStream();
+  const { transactions, status, loadMore, isLoadingMore, hasMore } = useTransactionStream();
   const [filter, setFilter] = useState<StatusFilter>("All");
 
   const visible = useMemo(
@@ -32,6 +32,14 @@ export function MonitorPage() {
 
       <FilterBar value={filter} onChange={setFilter} totalCount={transactions.length} visibleCount={visible.length} />
       <TransactionGrid transactions={visible} />
+
+      {hasMore && (
+        <div className="load-more">
+          <button className="btn-secondary" onClick={() => void loadMore()} disabled={isLoadingMore}>
+            {isLoadingMore ? "Loading..." : "Load more"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

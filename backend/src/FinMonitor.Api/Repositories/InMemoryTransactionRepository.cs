@@ -20,24 +20,16 @@ public sealed class InMemoryTransactionRepository : ITransactionRepository
     // TryRemove below is a no-op for those, which is harmless.
     private readonly ConcurrentQueue<Guid> _insertionOrder = new();
 
-    // Mirrors Postgres's BIGSERIAL: a monotonically increasing counter assigned per successful
-    // insert, so both storage providers give reconnecting clients the same "since sequence N"
-    // contract. Incrementing before the TryAdd check (so a rejected duplicate still consumes a
-    // value, leaving a gap) matches Postgres's own behavior under ON CONFLICT DO NOTHING -
-    // sequences are only promised to be monotonic, never contiguous.
-    private long _sequenceCounter;
-
     public Task<Transaction?> TryAddAsync(Transaction transaction, CancellationToken cancellationToken = default)
     {
-        var stamped = transaction with { Sequence = Interlocked.Increment(ref _sequenceCounter) };
-        if (!_store.TryAdd(stamped.TransactionId, stamped))
+        if (!_store.TryAdd(transaction.TransactionId, transaction))
         {
             return Task.FromResult<Transaction?>(null);
         }
 
-        _insertionOrder.Enqueue(stamped.TransactionId);
+        _insertionOrder.Enqueue(transaction.TransactionId);
         EvictExcess();
-        return Task.FromResult<Transaction?>(stamped);
+        return Task.FromResult<Transaction?>(transaction);
     }
 
     public Task<Transaction?> GetByIdAsync(Guid transactionId, CancellationToken cancellationToken = default) =>
@@ -69,23 +61,6 @@ public sealed class InMemoryTransactionRepository : ITransactionRepository
             : null;
 
         return Task.FromResult(new PagedResult<Transaction>(page, nextCursor));
-    }
-
-    // Matches PostgresTransactionRepository's MaxCatchUpBatch: a client reconnecting after a very
-    // long gap (or passing sequence=0) still gets a capped batch, not an unbounded dump of
-    // everything currently stored - this was previously uncapped here even though the Postgres
-    // side already enforced the same limit, an inconsistency between the two providers for the
-    // same operation.
-    private const int MaxCatchUpBatch = 1_000;
-
-    public Task<IReadOnlyList<Transaction>> GetSinceAsync(long sinceSequence, CancellationToken cancellationToken = default)
-    {
-        IReadOnlyList<Transaction> result = _store.Values
-            .Where(t => t.Sequence > sinceSequence)
-            .OrderBy(t => t.Sequence)
-            .Take(MaxCatchUpBatch)
-            .ToList();
-        return Task.FromResult(result);
     }
 
     private void EvictExcess()

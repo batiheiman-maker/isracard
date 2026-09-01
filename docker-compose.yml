@@ -17,13 +17,15 @@ services:
       interval: 2s
       timeout: 3s
       retries: 10
+    ports:
+      - "5661:5432"
 
   api1:
     build:
-      context: ./backend/src
-      dockerfile: FinMonitor.Api/Dockerfile
+      context: .
+      dockerfile: backend/src/FinMonitor.Api/Dockerfile
     environment: &api-env
-      Storage__Provider: Postgres
+      Storage__Provider: PostgresEf
       Storage__ConnectionString: "Host=postgres;Port=5432;Database=finmonitor;Username=finmonitor;Password=finmonitor"
       Redis__Enabled: "true"
       Redis__ConnectionString: "redis:6379,abortConnect=false"
@@ -36,8 +38,8 @@ services:
 
   api2:
     build:
-      context: ./backend/src
-      dockerfile: FinMonitor.Api/Dockerfile
+      context: .
+      dockerfile: backend/src/FinMonitor.Api/Dockerfile
     environment: *api-env
     depends_on:
       redis:
@@ -47,8 +49,8 @@ services:
 
   api3:
     build:
-      context: ./backend/src
-      dockerfile: FinMonitor.Api/Dockerfile
+      context: .
+      dockerfile: backend/src/FinMonitor.Api/Dockerfile
     environment: *api-env
     depends_on:
       redis:

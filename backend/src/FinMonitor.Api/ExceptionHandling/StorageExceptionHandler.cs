@@ -7,7 +7,7 @@ namespace FinMonitor.Api.ExceptionHandling;
 // Handles exactly one thing, named for it: a storage dependency that's temporarily unreachable.
 // It only knows about StorageUnavailableException, never Npgsql or any other storage-technology
 // type - that translation happens once, at the repository boundary (see
-// PostgresTransactionRepository.ExecuteAsync). If another category of exception needs its own
+// EfTransactionRepository.ExecuteAsync). If another category of exception needs its own
 // mapping later (validation, authorization, ...), add another IExceptionHandler beside this one
 // rather than growing this into a big switch - ASP.NET Core already tries every registered
 // IExceptionHandler in registration order until one returns true, so no extra plumbing is

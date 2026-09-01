@@ -1,4 +1,3 @@
-using FinMonitor.Api.Health;
 using FinMonitor.Domain.Repositories;
 
 namespace FinMonitor.Api.HostedServices;
@@ -31,9 +30,6 @@ public sealed class StorageStartupHostedService : IHostedService
             _logger.LogInformation("Initializing storage...");
             await initializer.InitializeAsync(cancellationToken);
         }
-
-        _healthState.MarkReady();
-        _logger.LogInformation("Storage ready; instance marked healthy.");
     }
 
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
