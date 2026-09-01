@@ -14,16 +14,13 @@ namespace FinMonitor.Api.HostedServices;
 public sealed class StorageStartupHostedService : IHostedService
 {
     private readonly ITransactionRepository _repository;
-    private readonly StartupHealthState _healthState;
     private readonly ILogger<StorageStartupHostedService> _logger;
 
     public StorageStartupHostedService(
         ITransactionRepository repository,
-        StartupHealthState healthState,
         ILogger<StorageStartupHostedService> logger)
     {
         _repository = repository;
-        _healthState = healthState;
         _logger = logger;
     }
 

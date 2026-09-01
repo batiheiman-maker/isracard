@@ -19,19 +19,16 @@ builder.Services.AddSwaggerGen();
 
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
-    options.SerializerOptions.Converters.Add(new JsonStringEnumConverter());
+    options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()); // why?
 });
 
-// Bound once into POCOs instead of scattered builder.Configuration["Section:Key"] string
-// lookups - a typo'd key now fails to compile rather than silently reading null/a wrong
-// default, and each section's shape and defaults live in one place (Options/*.cs).
+
 var storageOptions = builder.Configuration.GetSection(StorageOptions.SectionName).Get<StorageOptions>() ?? new StorageOptions();
 var redisOptions = builder.Configuration.GetSection(RedisOptions.SectionName).Get<RedisOptions>() ?? new RedisOptions();
 var deploymentOptions = builder.Configuration.GetSection(DeploymentOptions.SectionName).Get<DeploymentOptions>() ?? new DeploymentOptions();
 var corsOptions = builder.Configuration.GetSection(CorsOptions.SectionName).Get<CorsOptions>() ?? new CorsOptions();
 
-// A typo'd Storage:Provider (e.g. "Postgre") must fail loudly, not silently fall through to
-// InMemory - the same reasoning as the Deployment:Mode=Distributed guard below.
+
 if (!storageOptions.IsPostgres && !storageOptions.IsInMemory)
 {
     throw new InvalidOperationException(
@@ -74,8 +71,6 @@ if (deploymentOptions.IsDistributed)
             "clients connected to a different pod than the one that handled a POST.");
     }
 }
-
-builder.Services.AddSingleton<StartupHealthState>();
 
 // In-memory per pod by default; Postgres in distributed mode so GET is consistent across pods -
 // see PostgresTransactionRepository / the ADR in README.md for why Postgres over SQLite.
@@ -129,14 +124,9 @@ app.UseCors(CorsPolicy);
 app.MapTransactionEndpoints();
 app.MapHub<TransactionHub>("/hubs/transactions");
 
-// Doubles as readiness, liveness, and (via k8s startupProbe) startup check: before storage
-// finishes initializing (Postgres connect-retry + schema setup), this is 503 so k8s keeps
-// retrying instead of routing traffic here or killing the pod mid-startup; once
-// StorageStartupHostedService flips StartupHealthState, it's 200.
-app.MapGet("/healthz", (StartupHealthState healthState) =>
-    healthState.IsReady ? Results.Ok("Healthy") : Results.StatusCode(StatusCodes.Status503ServiceUnavailable))
+app.MapGet("/healthz", () =>
+    Results.Ok("Healthy"))
     .WithName("HealthCheck");
 
 app.Run();
 
-public partial class Program { }
